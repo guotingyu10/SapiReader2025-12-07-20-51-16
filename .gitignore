@@ -1,0 +1,76 @@
+# .NET 编译输出
+bin/
+obj/
+
+# Visual Studio 缓存/选项
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# 用户特定文件
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build 结果
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# NuGet 包
+*.nupkg
+*.snupkg
+**/packages/*
+
+# 测试结果
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# 用户配置文件（根据项目需求，可能需要保留 config.json 模板）
+# config.json  # 如果需要保留配置模板，注释掉这行
+
+# Rider
+.idea/
+*.sln.iml
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 发布文件
+publish/
+*.exe
+*.dll
+*.pdb
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+*~
