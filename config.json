@@ -5,5 +5,8 @@
   "Rate": 6,
   "Volume": 100,
   "EscapeRules": "",
-  "TopMost": true
+  "TopMost": true,
+  "OnlyReadFirstLine": true,
+  "ClearClipboard": false,
+  "RecordNumber": 10
 }

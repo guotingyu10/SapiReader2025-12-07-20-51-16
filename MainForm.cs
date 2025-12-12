@@ -37,7 +37,7 @@ public partial class MainForm : Form
     private List<InstalledVoice> _installedVoices = new();
 
     // 朗读记录（最多1000条，超出覆盖）
-    private const int MAX_HISTORY = 1000;
+    private int _maxHistory = 1000;
     private List<ReadingRecord> _readingHistory = new();
 
     // 当前热键配置（无修饰键）
@@ -59,8 +59,13 @@ public partial class MainForm : Form
     private Button _refreshVoiceButton = null!;
     private ListBox _historyListBox = null!;
     private Button _clearHistoryButton = null!;
+    private Label _recordNumberLabel = null!;
+    private TextBox _recordNumberTextBox = null!;
+
     private TextBox _escapeRulesTextBox = null!;
     private Button _saveConfigButton = null!;
+    private CheckBox _onlyReadFirstLineCheckBox = null!;
+    private CheckBox _clearClipboardCheckBox = null!;
 
     // 转义字符规则
     private Dictionary<string, string> _escapeRules = new();
@@ -71,9 +76,18 @@ public partial class MainForm : Form
 
     public MainForm()
     {
-        // 计算配置文件路径（单文件发布时使用 AppContext.BaseDirectory）
-        var exeDir = AppContext.BaseDirectory;
-        _configPath = Path.Combine(exeDir, "config.json");
+        // 计算配置文件路径
+        // 优先查找当前工作目录（方便开发调试和便携使用）
+        string currentDirConfig = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+        if (File.Exists(currentDirConfig))
+        {
+            _configPath = currentDirConfig;
+        }
+        else
+        {
+            // 否则使用应用程序所在目录
+            _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
+        }
         
         _isLoadingConfig = true; // 在初始化之前设置为 true
         
@@ -257,12 +271,35 @@ public partial class MainForm : Form
 
         var volumeHint = new Label { Text = "范围: 0 ~ 100", Location = new Point(770, 25), AutoSize = true, ForeColor = Color.Gray };
 
-        paramGroup.Controls.AddRange(new Control[] { _rateLabel, _rateTextBox, rateHint, _volumeLabel, _volumeTextBox, volumeHint });
+        _onlyReadFirstLineCheckBox = new CheckBox
+        {
+            Text = "只朗读第一行",
+            Location = new Point(10, 55),
+            AutoSize = true
+        };
+        _onlyReadFirstLineCheckBox.CheckedChanged += (s, e) =>
+        {
+            if (!_isLoadingConfig) SaveConfig();
+        };
+
+        _clearClipboardCheckBox = new CheckBox
+        {
+            Text = "朗读后恢复剪贴板",
+            Location = new Point(130, 55),
+            AutoSize = true,
+            Checked = true
+        };
+        _clearClipboardCheckBox.CheckedChanged += (s, e) =>
+        {
+            if (!_isLoadingConfig) SaveConfig();
+        };
+
+        paramGroup.Controls.AddRange(new Control[] { _rateLabel, _rateTextBox, rateHint, _volumeLabel, _volumeTextBox, volumeHint, _onlyReadFirstLineCheckBox, _clearClipboardCheckBox });
 
         // 朗读记录区域
         var historyGroup = new GroupBox
         {
-            Text = "朗读记录（最近1000条）",
+            Text = "朗读记录",
             Location = new Point(15, 235),
             Size = new Size(955, 165)
         };
@@ -282,7 +319,42 @@ public partial class MainForm : Form
         };
         _clearHistoryButton.Click += (s, e) => { _readingHistory.Clear(); _historyListBox.Items.Clear(); };
 
-        historyGroup.Controls.AddRange(new Control[] { _historyListBox, _clearHistoryButton });
+        _recordNumberLabel = new Label { Text = "记录条数:", Location = new Point(10, 148), AutoSize = true };
+        _recordNumberTextBox = new TextBox
+        {
+            Location = new Point(75, 145),
+            Size = new Size(60, 25),
+            Text = "1000"
+        };
+        _recordNumberTextBox.KeyPress += (s, e) =>
+        {
+            if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar))
+            {
+                e.Handled = true;
+            }
+        };
+        _recordNumberTextBox.TextChanged += (s, e) =>
+        {
+            if (int.TryParse(_recordNumberTextBox.Text, out int value) && value > 0)
+            {
+                _maxHistory = value;
+                if (!_isLoadingConfig) SaveConfig();
+                _recordNumberTextBox.ForeColor = Color.Black;
+                
+                // 如果当前记录数超过新限制，进行修剪
+                while (_readingHistory.Count > _maxHistory)
+                {
+                    _readingHistory.RemoveAt(0);
+                    _historyListBox.Items.RemoveAt(0);
+                }
+            }
+            else
+            {
+                _recordNumberTextBox.ForeColor = Color.Red;
+            }
+        };
+
+        historyGroup.Controls.AddRange(new Control[] { _historyListBox, _clearHistoryButton, _recordNumberLabel, _recordNumberTextBox });
 
         // 转义字符设置区域
         var escapeGroup = new GroupBox
@@ -582,6 +654,16 @@ public partial class MainForm : Form
                 return;
             }
 
+            // 如果开启了只朗读第一行
+            if (_onlyReadFirstLineCheckBox.Checked)
+            {
+                int newlineIndex = text.IndexOfAny(new[] { '\r', '\n' });
+                if (newlineIndex >= 0)
+                {
+                    text = text.Substring(0, newlineIndex);
+                }
+            }
+
             // 应用转义规则
             string processedText = ApplyEscapeRules(text);
 
@@ -589,13 +671,16 @@ public partial class MainForm : Form
             AddReadingRecord(processedText);
 
             // 立即清理剪贴板（恢复之前的内容或清空）
-            if (_previousClipboard != null)
+            if (_clearClipboardCheckBox.Checked)
             {
-                Clipboard.SetText(_previousClipboard);
-            }
-            else
-            {
-                Clipboard.Clear();
+                if (_previousClipboard != null)
+                {
+                    Clipboard.SetText(_previousClipboard);
+                }
+                else
+                {
+                    Clipboard.Clear();
+                }
             }
 
             // 开始朗读（从内存中读取）
@@ -675,8 +760,8 @@ public partial class MainForm : Form
             Text = text.Length > 100 ? text.Substring(0, 100) + "..." : text
         };
 
-        // 超过1000条则移除最旧的
-        if (_readingHistory.Count >= MAX_HISTORY)
+        // 超过限制则移除最旧的
+        if (_readingHistory.Count >= _maxHistory)
         {
             _readingHistory.RemoveAt(0);
             _historyListBox.Items.RemoveAt(0);
@@ -769,6 +854,9 @@ public partial class MainForm : Form
                 VoiceName = voiceName,
                 Rate = int.TryParse(_rateTextBox.Text, out int rate) ? rate : 0,
                 Volume = int.TryParse(_volumeTextBox.Text, out int volume) ? volume : 100,
+                OnlyReadFirstLine = _onlyReadFirstLineCheckBox.Checked,
+                ClearClipboard = _clearClipboardCheckBox.Checked,
+                RecordNumber = int.TryParse(_recordNumberTextBox.Text, out int recordNum) ? recordNum : 1000,
                 EscapeRules = _escapeRulesTextBox.Text,
                 TopMost = this.TopMost
             };
@@ -789,7 +877,13 @@ public partial class MainForm : Form
             if (!File.Exists(_configPath)) return;
 
             var json = File.ReadAllText(_configPath);
-            var config = JsonSerializer.Deserialize<AppConfig>(json);
+            var options = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
+            };
+            var config = JsonSerializer.Deserialize<AppConfig>(json, options);
             if (config == null) return;
 
             // 恢复热键设置
@@ -814,6 +908,15 @@ public partial class MainForm : Form
             if (config.Volume >= 0 && config.Volume <= 100)
             {
                 _volumeTextBox.Text = config.Volume.ToString();
+            }
+
+            _onlyReadFirstLineCheckBox.Checked = config.OnlyReadFirstLine;
+            _clearClipboardCheckBox.Checked = config.ClearClipboard;
+
+            if (config.RecordNumber > 0)
+            {
+                _recordNumberTextBox.Text = config.RecordNumber.ToString();
+                _maxHistory = config.RecordNumber;
             }
 
             // 恢复转义规则
@@ -865,6 +968,9 @@ public class AppConfig
     public int Volume { get; set; } = 100;
     public string EscapeRules { get; set; } = "";
     public bool TopMost { get; set; } = false;
+    public bool OnlyReadFirstLine { get; set; } = false;
+    public bool ClearClipboard { get; set; } = true;
+    public int RecordNumber { get; set; } = 1000;
 }
 
 // 朗读记录类
