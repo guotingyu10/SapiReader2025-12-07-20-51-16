@@ -1,12 +1,15 @@
 {
   "HotkeyIndex": 0,
   "StopHotkeyIndex": 2,
+ "AutoReadHotkeyIndex": "Ctrl+Alt+S",
   "VoiceName": "Microsoft Xiaoxiao",
   "Rate": 6,
   "Volume": 100,
   "EscapeRules": "",
   "TopMost": true,
-  "OnlyReadFirstLine": true,
+  "OnlyReadFirstLine": false,
   "ClearClipboard": false,
-  "RecordNumber": 10
+  "RecordNumber": 10,
+  "RemoveSpaces": false,
+  "AutoReadDelay": 100
 }
