@@ -21,19 +21,25 @@ public partial class MainForm : Form
     private const uint MOD_CONTROL = 0x0002;
     private const uint MOD_SHIFT = 0x0004;
     private const int HOTKEY_ID = 0x1234;
+    private const int AUTO_READ_HOTKEY_ID = 0x5678;
     private const int WM_HOTKEY = 0x0312;
 
     private const int KEYEVENTF_KEYDOWN = 0x0000;
     private const int KEYEVENTF_KEYUP = 0x0002;
     private const byte VK_CONTROL = 0x11;
     private const byte VK_C = 0x43;
+    private const byte VK_SHIFT = 0x10;
+    private const byte VK_HOME = 0x24;
+    private const byte VK_END = 0x23;
+    private const byte VK_DOWN = 0x28;
 
     #endregion
 
     private SpeechSynthesizer _voice = null!;
     private NotifyIcon _trayIcon = null!;
     private bool _isSpeaking = false;
-    private string? _previousClipboard = null;
+    private bool _isAutoReading = false;
+    private IDataObject? _previousClipboard = null;
     private List<InstalledVoice> _installedVoices = new();
 
     // 朗读记录（最多1000条，超出覆盖）
@@ -43,30 +49,25 @@ public partial class MainForm : Form
     // 当前热键配置（无修饰键）
     private uint _hotkeyKey = 0x70; // F1
     private uint _stopHotkeyKey = 0x71; // F2
+    private uint _autoReadHotkeyKey = 0x70; // F1 (Ctrl+Shift+F1)
+    private uint _autoReadModifiers = MOD_CONTROL | MOD_SHIFT; // 默认修饰键
+    private string _customAutoReadHotKey = ""; // 当前生效的热键字符串
     private const int STOP_HOTKEY_ID = 2;
 
-    // UI 控件
-    private ComboBox _keyCombo = null!;
-    private ComboBox _stopKeyCombo = null!;
-    private Button _applyButton = null!;
-    private Button _topMostButton = null!;
-    private Label _statusLabel = null!;
-    private TextBox _rateTextBox = null!;
-    private TextBox _volumeTextBox = null!;
-    private Label _rateLabel = null!;
-    private Label _volumeLabel = null!;
-    private ComboBox _voiceCombo = null!;
-    private Button _refreshVoiceButton = null!;
+    // UI 控件 (新版)
+    private TextBox _configEditor = null!;
+    private Button _saveConfigButton = null!;
+    private Button _listVoicesButton = null!;
     private ListBox _historyListBox = null!;
     private Button _clearHistoryButton = null!;
-    private Label _recordNumberLabel = null!;
-    private TextBox _recordNumberTextBox = null!;
+    private Label _statusLabel = null!;
 
-    private TextBox _escapeRulesTextBox = null!;
-    private Button _saveConfigButton = null!;
-    private CheckBox _onlyReadFirstLineCheckBox = null!;
-    private CheckBox _clearClipboardCheckBox = null!;
-
+    // 配置相关字段
+    private bool _onlyReadFirstLine = false;
+    private bool _clearClipboard = true;
+    private bool _removeSpaces = false;
+    private int _autoReadDelay = 1000;
+    
     // 转义字符规则
     private Dictionary<string, string> _escapeRules = new();
 
@@ -89,341 +90,114 @@ public partial class MainForm : Form
             _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
         }
         
-        _isLoadingConfig = true; // 在初始化之前设置为 true
+        _isLoadingConfig = true;
         
         InitializeComponent();
         InitializeVoice();
         InitializeTrayIcon();
         LoadConfig();
-        RegisterCurrentHotkey();
         
-        _isLoadingConfig = false; // 初始化完成后设置为 false
+        _isLoadingConfig = false;
     }
 
     private void InitializeComponent()
     {
-        this.Text = "SAPI5 文本朗读工具";
+        this.Text = "SAPI5 文本朗读工具 (Config Editor Mode)";
         this.Size = new Size(1000, 700);
         this.FormBorderStyle = FormBorderStyle.Sizable;
         this.MaximizeBox = true;
         this.MinimumSize = new Size(600, 700);
         this.StartPosition = FormStartPosition.CenterScreen;
 
-        // 热键设置区域（简化为只选择功能键）
-        var hotkeyGroup = new GroupBox
+        // 1. 配置编辑器区域
+        var editorLabel = new Label
         {
-            Text = "快捷键设置",
-            Location = new Point(15, 15),
-            Size = new Size(955, 55)
-        };
-
-        var keyLabel = new Label { Text = "朗读热键:", Location = new Point(10, 22), AutoSize = true };
-        _keyCombo = new ComboBox
-        {
-            Location = new Point(175, 19),
-            Size = new Size(80, 25),
-            DropDownStyle = ComboBoxStyle.DropDownList
-        };
-        for (int i = 1; i <= 12; i++) _keyCombo.Items.Add($"F{i}");
-        _keyCombo.SelectedIndex = 0;
-
-        var stopKeyLabel = new Label { Text = "停止热键:", Location = new Point(280, 22), AutoSize = true };
-        _stopKeyCombo = new ComboBox
-        {
-            Location = new Point(445, 19),
-            Size = new Size(80, 25),
-            DropDownStyle = ComboBoxStyle.DropDownList
-        };
-        for (int i = 1; i <= 12; i++) _stopKeyCombo.Items.Add($"F{i}");
-        _stopKeyCombo.SelectedIndex = 1; // 默认 F2
-
-        _applyButton = new Button { Text = "应用", Location = new Point(535, 18), Size = new Size(50, 25) };
-        _applyButton.Click += ApplyHotkey_Click;
-
-        _topMostButton = new Button { Text = "置顶", Location = new Point(595, 18), Size = new Size(60, 25) };
-        _topMostButton.Click += TopMostButton_Click;
-
-        var hotkeyTip = new Label { Text = "（直接按功能键即可触发）", Location = new Point(665, 22), AutoSize = true, ForeColor = Color.Gray };
-
-        hotkeyGroup.Controls.AddRange(new Control[] { keyLabel, _keyCombo, stopKeyLabel, _stopKeyCombo, _applyButton, _topMostButton, hotkeyTip });
-
-        // 发音人设置区域
-        var voiceGroup = new GroupBox
-        {
-            Text = "发音人设置",
-            Location = new Point(15, 80),
-            Size = new Size(955, 55)
-        };
-
-        var voiceLabel = new Label { Text = "发音人:", Location = new Point(10, 22), AutoSize = true };
-        _voiceCombo = new ComboBox
-        {
-            Location = new Point(165, 19),
-            Size = new Size(700, 25),
-            DropDownStyle = ComboBoxStyle.DropDownList
-        };
-        _voiceCombo.SelectedIndexChanged += VoiceCombo_SelectedIndexChanged;
-
-        _refreshVoiceButton = new Button
-        {
-            Text = "刷新",
-            Location = new Point(880, 18),
-            Size = new Size(60, 25)
-        };
-        _refreshVoiceButton.Click += RefreshVoices_Click;
-
-        voiceGroup.Controls.AddRange(new Control[] { voiceLabel, _voiceCombo, _refreshVoiceButton });
-
-        // 语音参数设置
-        var paramGroup = new GroupBox
-        {
-            Text = "语音参数",
-            Location = new Point(15, 145),
-            Size = new Size(955, 80)
-        };
-
-        _rateLabel = new Label { Text = "语速 (-10 到 10):", Location = new Point(10, 25), AutoSize = true };
-        _rateTextBox = new TextBox
-        {
-            Location = new Point(220, 22),
-            Size = new Size(100, 25),
-            Text = "0"
-        };
-        _rateTextBox.KeyPress += (s, e) =>
-        {
-            // 只允许数字、负号和控制键
-            if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar) && e.KeyChar != '-')
-            {
-                e.Handled = true;
-            }
-            // 负号只能在开头
-            if (e.KeyChar == '-' && ((TextBox)s!).Text.Length > 0)
-            {
-                e.Handled = true;
-            }
-        };
-        _rateTextBox.TextChanged += (s, e) =>
-        {
-            if (int.TryParse(_rateTextBox.Text, out int value))
-            {
-                if (value >= -10 && value <= 10)
-                {
-                    if (_voice != null) _voice.Rate = value;
-                    if (!_isLoadingConfig) SaveConfig();
-                    _rateTextBox.ForeColor = Color.Black;
-                }
-                else
-                {
-                    _rateTextBox.ForeColor = Color.Red;
-                }
-            }
-            else if (string.IsNullOrEmpty(_rateTextBox.Text) || _rateTextBox.Text == "-")
-            {
-                _rateTextBox.ForeColor = Color.Black;
-            }
-            else
-            {
-                _rateTextBox.ForeColor = Color.Red;
-            }
-        };
-
-        var rateHint = new Label { Text = "范围: -10 ~ 10", Location = new Point(330, 25), AutoSize = true, ForeColor = Color.Gray };
-
-        _volumeLabel = new Label { Text = "音量 (0 到 100):", Location = new Point(500, 25), AutoSize = true };
-        _volumeTextBox = new TextBox
-        {
-            Location = new Point(660, 22),
-            Size = new Size(100, 25),
-            Text = "100"
-        };
-        _volumeTextBox.KeyPress += (s, e) =>
-        {
-            // 只允许数字和控制键
-            if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar))
-            {
-                e.Handled = true;
-            }
-        };
-        _volumeTextBox.TextChanged += (s, e) =>
-        {
-            if (int.TryParse(_volumeTextBox.Text, out int value))
-            {
-                if (value >= 0 && value <= 100)
-                {
-                    if (_voice != null) _voice.Volume = value;
-                    if (!_isLoadingConfig) SaveConfig();
-                    _volumeTextBox.ForeColor = Color.Black;
-                }
-                else
-                {
-                    _volumeTextBox.ForeColor = Color.Red;
-                }
-            }
-            else if (string.IsNullOrEmpty(_volumeTextBox.Text))
-            {
-                _volumeTextBox.ForeColor = Color.Black;
-            }
-            else
-            {
-                _volumeTextBox.ForeColor = Color.Red;
-            }
-        };
-
-        var volumeHint = new Label { Text = "范围: 0 ~ 100", Location = new Point(770, 25), AutoSize = true, ForeColor = Color.Gray };
-
-        _onlyReadFirstLineCheckBox = new CheckBox
-        {
-            Text = "只朗读第一行",
-            Location = new Point(10, 55),
-            AutoSize = true
-        };
-        _onlyReadFirstLineCheckBox.CheckedChanged += (s, e) =>
-        {
-            if (!_isLoadingConfig) SaveConfig();
-        };
-
-        _clearClipboardCheckBox = new CheckBox
-        {
-            Text = "朗读后恢复剪贴板",
-            Location = new Point(130, 55),
+            Text = "配置文件编辑器 (config.json):",
+            Location = new Point(15, 10),
             AutoSize = true,
-            Checked = true
-        };
-        _clearClipboardCheckBox.CheckedChanged += (s, e) =>
-        {
-            if (!_isLoadingConfig) SaveConfig();
+            Font = new Font(this.Font, FontStyle.Bold)
         };
 
-        paramGroup.Controls.AddRange(new Control[] { _rateLabel, _rateTextBox, rateHint, _volumeLabel, _volumeTextBox, volumeHint, _onlyReadFirstLineCheckBox, _clearClipboardCheckBox });
-
-        // 朗读记录区域
-        var historyGroup = new GroupBox
+        _configEditor = new TextBox
         {
-            Text = "朗读记录",
-            Location = new Point(15, 235),
-            Size = new Size(955, 165)
+            Location = new Point(15, 35),
+            Size = new Size(955, 300),
+            Multiline = true,
+            ScrollBars = ScrollBars.Vertical,
+            Font = new Font("Consolas", 10F),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        };
+
+        // 2. 按钮区域
+        _saveConfigButton = new Button
+        {
+            Text = "保存并应用配置",
+            Location = new Point(15, 345),
+            Size = new Size(150, 30),
+            BackColor = Color.LightGreen
+        };
+        _saveConfigButton.Click += (s, e) => SaveConfig();
+
+        _listVoicesButton = new Button
+        {
+            Text = "发音人列表(点击复制)▼",
+            Location = new Point(180, 345),
+            Size = new Size(180, 30)
+        };
+        _listVoicesButton.Click += ListVoices_Click;
+
+        var helpLabel = new Label
+        {
+            Text = "提示：直接修改上方 JSON 内容，点击保存即可生效。所有设置均通过此文件管理。",
+            Location = new Point(340, 350),
+            AutoSize = true,
+            ForeColor = Color.Gray
+        };
+
+        // 3. 朗读记录区域
+        var historyLabel = new Label
+        {
+            Text = "朗读记录:",
+            Location = new Point(15, 390),
+            AutoSize = true
         };
 
         _historyListBox = new ListBox
         {
-            Location = new Point(10, 22),
-            Size = new Size(935, 115),
-            HorizontalScrollbar = true
+            Location = new Point(15, 415),
+            Size = new Size(955, 180),
+            HorizontalScrollbar = true,
+            Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
         };
 
         _clearHistoryButton = new Button
         {
             Text = "清空记录",
-            Location = new Point(870, 145),
-            Size = new Size(75, 25)
+            Location = new Point(895, 385),
+            Size = new Size(75, 25),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
         _clearHistoryButton.Click += (s, e) => { _readingHistory.Clear(); _historyListBox.Items.Clear(); };
 
-        _recordNumberLabel = new Label { Text = "记录条数:", Location = new Point(10, 148), AutoSize = true };
-        _recordNumberTextBox = new TextBox
-        {
-            Location = new Point(75, 145),
-            Size = new Size(60, 25),
-            Text = "1000"
-        };
-        _recordNumberTextBox.KeyPress += (s, e) =>
-        {
-            if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar))
-            {
-                e.Handled = true;
-            }
-        };
-        _recordNumberTextBox.TextChanged += (s, e) =>
-        {
-            if (int.TryParse(_recordNumberTextBox.Text, out int value) && value > 0)
-            {
-                _maxHistory = value;
-                if (!_isLoadingConfig) SaveConfig();
-                _recordNumberTextBox.ForeColor = Color.Black;
-                
-                // 如果当前记录数超过新限制，进行修剪
-                while (_readingHistory.Count > _maxHistory)
-                {
-                    _readingHistory.RemoveAt(0);
-                    _historyListBox.Items.RemoveAt(0);
-                }
-            }
-            else
-            {
-                _recordNumberTextBox.ForeColor = Color.Red;
-            }
-        };
-
-        historyGroup.Controls.AddRange(new Control[] { _historyListBox, _clearHistoryButton, _recordNumberLabel, _recordNumberTextBox });
-
-        // 转义字符设置区域
-        var escapeGroup = new GroupBox
-        {
-            Text = "转义字符设置（文本替换规则）",
-            Location = new Point(15, 410),
-            Size = new Size(955, 150)
-        };
-
-        var escapeHint = new Label
-        {
-            Text = "语法：\"\u539f\u6587\u672c1\",\"替\u6362\u6587\u672c1\"; \"\u539f\u6587\u672c2\",\"替\u6362\u6587\u672c2\"; ...",
-            Location = new Point(10, 20),
-            Size = new Size(935, 20),
-            ForeColor = Color.Gray
-        };
-
-        _escapeRulesTextBox = new TextBox
-        {
-            Location = new Point(10, 45),
-            Size = new Size(935, 75),
-            Multiline = true,
-            ScrollBars = ScrollBars.Vertical,
-            Font = new Font("Consolas", 9F)
-        };
-        _escapeRulesTextBox.TextChanged += EscapeRulesTextBox_TextChanged;
-
-        var escapeExample = new Label
-        {
-            Text = "示例: \"\\n\",\" \"; \"(\",\"\"; \")\",\"\"; \"\u3010\",\"\"; \"\u3011\",\"\"",
-            Location = new Point(10, 125),
-            Size = new Size(935, 20),
-            ForeColor = Color.DarkGreen
-        };
-
-        _saveConfigButton = new Button
-        {
-            Text = "保存设置",
-            Location = new Point(850, 120),
-            Size = new Size(95, 25)
-        };
-        _saveConfigButton.Click += (s, e) =>
-        {
-            SaveConfig();
-            _statusLabel.Text = "设置已保存";
-            _statusLabel.ForeColor = Color.Green;
-        };
-
-        escapeGroup.Controls.AddRange(new Control[] { escapeHint, _escapeRulesTextBox, escapeExample, _saveConfigButton });
-
-        // 状态栏
+        // 4. 状态栏
         _statusLabel = new Label
         {
-            Text = "就绪 - 按 F1 朗读选中文本，按 F2 停止",
-            Location = new Point(15, 570),
-            Size = new Size(955, 20),
+            Text = "就绪",
+            Dock = DockStyle.Bottom,
+            AutoSize = false,
+            Height = 25,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(5, 0, 0, 0),
+            BackColor = SystemColors.ControlLight,
             ForeColor = Color.Green
         };
 
-        // 说明标签
-        var infoLabel = new Label
-        {
-            Text = "使用说明：选中任意文本，按快捷键即可朗读。",
-            Location = new Point(15, 595),
-            Size = new Size(955, 40),
-            ForeColor = Color.Gray
-        };
-
-        this.Controls.AddRange(new Control[] { hotkeyGroup, voiceGroup, paramGroup, historyGroup, escapeGroup, _statusLabel, infoLabel });
+        this.Controls.AddRange(new Control[] { 
+            editorLabel, _configEditor, 
+            _saveConfigButton, _listVoicesButton, helpLabel,
+            historyLabel, _historyListBox, _clearHistoryButton,
+            _statusLabel 
+        });
 
         this.Resize += MainForm_Resize;
     }
@@ -431,73 +205,53 @@ public partial class MainForm : Form
     private void InitializeVoice()
     {
         _voice = new SpeechSynthesizer();
-        RefreshVoiceList();
+        // 获取发音人列表供查询
+        _installedVoices = _voice.GetInstalledVoices().Where(v => v.Enabled).ToList();
     }
 
-    private void RefreshVoiceList()
+    private void ListVoices_Click(object? sender, EventArgs e)
     {
-        string? currentVoiceName = null;
-        if (_voiceCombo.SelectedIndex >= 0 && _voiceCombo.SelectedIndex < _installedVoices.Count)
+        var menu = new ContextMenuStrip();
+        
+        if (_installedVoices.Count == 0)
         {
-            currentVoiceName = _installedVoices[_voiceCombo.SelectedIndex].VoiceInfo.Name;
+             menu.Items.Add("未检测到发音人").Enabled = false;
+        }
+        else
+        {
+             // 添加提示项
+             var titleItem = menu.Items.Add("点击以下名称即可复制:");
+             titleItem.Enabled = false;
+             titleItem.BackColor = Color.WhiteSmoke;
+             menu.Items.Add(new ToolStripSeparator());
+
+             foreach (var voice in _installedVoices)
+             {
+                 string name = voice.VoiceInfo.Name;
+                 menu.Items.Add(name, null, (s, args) => 
+                 {
+                     try 
+                     {
+                         Clipboard.SetText(name);
+                         _statusLabel.Text = $"已复制发音人: \"{name}\"";
+                         _statusLabel.ForeColor = Color.Green;
+                         
+                         // 简单的视觉反馈，让用户知道操作成功
+                         if (_configEditor.Text.Contains("\"VoiceName\": \"\""))
+                         {
+                              // 如果是空配置，提示用户可以粘贴
+                              MessageBox.Show($"已复制: {name}\r\n请在 VoiceName 字段的双引号中粘贴 (Ctrl+V)", "复制成功");
+                         }
+                     }
+                     catch (Exception ex)
+                     {
+                         MessageBox.Show($"复制失败: {ex.Message}", "错误");
+                     }
+                 });
+             }
         }
         
-        _voiceCombo.Items.Clear();
-
-        // 重新创建 SpeechSynthesizer 以获取最新的发音人列表
-        _voice?.Dispose();
-        _voice = new SpeechSynthesizer();
-
-        // 加载所有可用的发音人（包括第三方 SAPI5 发音人）
-        _installedVoices = _voice.GetInstalledVoices().Where(v => v.Enabled).ToList();
-        foreach (var voice in _installedVoices)
-        {
-            string displayName = $"{voice.VoiceInfo.Name} ({voice.VoiceInfo.Culture.DisplayName})";
-            _voiceCombo.Items.Add(displayName);
-        }
-
-        // 尝试恢复之前选择的发音人
-        if (_voiceCombo.Items.Count > 0)
-        {
-            int idx = -1;
-            if (currentVoiceName != null)
-            {
-                for (int i = 0; i < _installedVoices.Count; i++)
-                {
-                    if (_installedVoices[i].VoiceInfo.Name == currentVoiceName)
-                    {
-                        idx = i;
-                        break;
-                    }
-                }
-            }
-            _voiceCombo.SelectedIndex = idx >= 0 ? idx : 0;
-        }
-
-        _statusLabel.Text = $"已加载 {_installedVoices.Count} 个发音人";
-        _statusLabel.ForeColor = Color.Green;
-    }
-
-    private void RefreshVoices_Click(object? sender, EventArgs e)
-    {
-        RefreshVoiceList();
-    }
-
-    private void VoiceCombo_SelectedIndexChanged(object? sender, EventArgs e)
-    {
-        if (_voiceCombo.SelectedIndex >= 0 && _voiceCombo.SelectedIndex < _installedVoices.Count)
-        {
-            try
-            {
-                var selectedVoice = _installedVoices[_voiceCombo.SelectedIndex];
-                _voice.SelectVoice(selectedVoice.VoiceInfo.Name);
-                if (!_isLoadingConfig) SaveConfig();
-            }
-            catch
-            {
-                // 如果选择失败，使用默认语音
-            }
-        }
+        menu.Show(_listVoicesButton, 0, _listVoicesButton.Height);
     }
 
     private void InitializeTrayIcon()
@@ -511,6 +265,13 @@ public partial class MainForm : Form
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示主窗口", null, (s, e) => { this.Show(); this.WindowState = FormWindowState.Normal; });
+        menu.Items.Add("开始自动朗读", null, (s, e) => { 
+            Task.Run(async () => {
+                await Task.Delay(3000); // 3秒倒计时
+                this.Invoke(() => StartAutoRead());
+            });
+            _trayIcon.ShowBalloonTip(3000, "准备开始", "请在3秒内切换到要朗读的文本窗口...", ToolTipIcon.Info);
+        });
         menu.Items.Add("停止朗读", null, (s, e) => StopSpeaking());
         menu.Items.Add("-");
         menu.Items.Add("退出", null, (s, e) => { _trayIcon.Visible = false; Application.Exit(); });
@@ -530,11 +291,16 @@ public partial class MainForm : Form
 
     private void RegisterCurrentHotkey()
     {
-        // 无修饰键，直接注册功能键
+        // 先取消当前热键
+        UnregisterHotKey(this.Handle, HOTKEY_ID);
+        UnregisterHotKey(this.Handle, STOP_HOTKEY_ID);
+        UnregisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID);
+
+        // 注册朗读热键
         bool ok = RegisterHotKey(this.Handle, HOTKEY_ID, 0, _hotkeyKey);
         if (!ok)
         {
-            _statusLabel.Text = "朗读热键注册失败！可能被其他程序占用";
+            _statusLabel.Text = $"朗读热键(F{_hotkeyKey - 0x6F})注册失败！可能被占用";
             _statusLabel.ForeColor = Color.Red;
         }
         
@@ -542,9 +308,12 @@ public partial class MainForm : Form
         bool stopOk = RegisterHotKey(this.Handle, STOP_HOTKEY_ID, 0, _stopHotkeyKey);
         if (!stopOk)
         {
-            _statusLabel.Text = "停止热键注册失败！可能被其他程序占用";
+            _statusLabel.Text = $"停止热键(F{_stopHotkeyKey - 0x6F})注册失败！可能被占用";
             _statusLabel.ForeColor = Color.Red;
         }
+        
+        // 注册自动朗读热键
+        bool autoReadOk = RegisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID, _autoReadModifiers, _autoReadHotkeyKey);
         
         if (ok && stopOk)
         {
@@ -554,45 +323,10 @@ public partial class MainForm : Form
 
     private void UpdateStatusLabel()
     {
-        string keyStr = _keyCombo.SelectedItem?.ToString() ?? "F1";
-        string stopKeyStr = _stopKeyCombo.SelectedItem?.ToString() ?? "F2";
-        _statusLabel.Text = $"就绪 - 按 {keyStr} 朗读选中文本，按 {stopKeyStr} 停止";
+        string keyStr = $"F{_hotkeyKey - 0x6F}";
+        string stopKeyStr = $"F{_stopHotkeyKey - 0x6F}";
+        _statusLabel.Text = $"配置已应用 - 按 {keyStr} 朗读，按 {stopKeyStr} 停止";
         _statusLabel.ForeColor = Color.Green;
-    }
-
-    private void ApplyHotkey_Click(object? sender, EventArgs e)
-    {
-        // 先取消当前热键
-        UnregisterHotKey(this.Handle, HOTKEY_ID);
-        UnregisterHotKey(this.Handle, STOP_HOTKEY_ID);
-
-        // 解析功能键 (F1=0x70, F2=0x71, ..., F12=0x7B)
-        _hotkeyKey = (uint)(0x70 + _keyCombo.SelectedIndex);
-        _stopHotkeyKey = (uint)(0x70 + _stopKeyCombo.SelectedIndex);
-
-        // 注册新热键
-        RegisterCurrentHotkey();
-        SaveConfig();
-    }
-
-    private void TopMostButton_Click(object? sender, EventArgs e)
-    {
-        this.TopMost = !this.TopMost;
-        if (this.TopMost)
-        {
-            _topMostButton.Text = "取消置顶";
-            _topMostButton.BackColor = Color.LightBlue;
-            _statusLabel.Text = "窗口已置顶";
-            _statusLabel.ForeColor = Color.Green;
-        }
-        else
-        {
-            _topMostButton.Text = "置顶";
-            _topMostButton.BackColor = SystemColors.Control;
-            _statusLabel.Text = "已取消置顶";
-            _statusLabel.ForeColor = Color.Green;
-        }
-        SaveConfig();
     }
 
     protected override void WndProc(ref Message m)
@@ -607,97 +341,98 @@ public partial class MainForm : Form
             {
                 StopSpeaking();
             }
+            else if (m.WParam.ToInt32() == AUTO_READ_HOTKEY_ID)
+            {
+                if (_isAutoReading)
+                {
+                    StopSpeaking();
+                }
+                else
+                {
+                    StartAutoRead();
+                }
+            }
         }
         base.WndProc(ref m);
     }
 
     private async void HandleHotkey()
     {
-        // 如果正在朗读，立即停止并重新朗读
         if (_isSpeaking)
         {
             _voice.SpeakAsyncCancelAll();
             _isSpeaking = false;
-            // 等待语音引擎真正停止
-            await Task.Delay(100);
+            while (_voice.State == SynthesizerState.Speaking)
+            {
+                await Task.Delay(10);
+            }
+            UpdateStatusLabel();
         }
 
         try
         {
-            // 保存当前剪贴板内容
             _previousClipboard = null;
-            if (Clipboard.ContainsText())
+            try
             {
-                _previousClipboard = Clipboard.GetText();
+                var data = Clipboard.GetDataObject();
+                if (data != null) _previousClipboard = data;
             }
+            catch {}
 
-            // 模拟 Ctrl+C
             SimulateCtrlC();
-
-            // 等待复制完成
             await Task.Delay(150);
 
-            // 读取剪贴板
             string text = "";
             if (Clipboard.ContainsText())
             {
                 text = Clipboard.GetText();
             }
 
-            // 如果复制的内容与之前相同，说明没有新选中的文本
-            if (string.IsNullOrWhiteSpace(text) || text == _previousClipboard)
+            if (string.IsNullOrWhiteSpace(text))
             {
-                _statusLabel.Text = "未检测到选中的文本";
+                _statusLabel.Text = "剪贴板为空";
                 _statusLabel.ForeColor = Color.Orange;
                 await Task.Delay(2000);
                 UpdateStatusLabel();
                 return;
             }
-
-            // 如果开启了只朗读第一行
-            if (_onlyReadFirstLineCheckBox.Checked)
+            
+            if (_onlyReadFirstLine)
             {
                 int newlineIndex = text.IndexOfAny(new[] { '\r', '\n' });
-                if (newlineIndex >= 0)
-                {
-                    text = text.Substring(0, newlineIndex);
-                }
+                if (newlineIndex >= 0) text = text.Substring(0, newlineIndex);
             }
 
-            // 应用转义规则
+            if (_removeSpaces)
+            {
+                text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
+            }
+
             string processedText = ApplyEscapeRules(text);
 
-            // 添加到朗读记录（保存转义后的文本到内存）
             AddReadingRecord(processedText);
 
-            // 立即清理剪贴板（恢复之前的内容或清空）
-            if (_clearClipboardCheckBox.Checked)
+            if (_clearClipboard)
             {
-                if (_previousClipboard != null)
+                try
                 {
-                    Clipboard.SetText(_previousClipboard);
+                    if (_previousClipboard != null) Clipboard.SetDataObject(_previousClipboard, true);
+                    else Clipboard.Clear();
                 }
-                else
-                {
-                    Clipboard.Clear();
-                }
+                catch {}
             }
 
-            // 开始朗读（从内存中读取）
             _isSpeaking = true;
             _statusLabel.Text = "正在朗读...";
             _statusLabel.ForeColor = Color.Blue;
 
-            // 异步朗读
             _voice.SpeakAsync(processedText);
             
-            // 等待朗读完成
             while (_isSpeaking && _voice.State == SynthesizerState.Speaking)
             {
-                await Task.Delay(50); // 减少轮询间隔，提高响应速度
+                await Task.Delay(50);
             }
 
-            // 只有在正常完成时才重置状态
             if (_isSpeaking)
             {
                 _isSpeaking = false;
@@ -707,7 +442,6 @@ public partial class MainForm : Form
         catch (Exception ex)
         {
             _isSpeaking = false;
-            // 忽略取消异常
             if (!ex.Message.Contains("canceled") && !ex.Message.Contains("cancelled"))
             {
                 _statusLabel.Text = $"错误: {ex.Message}";
@@ -722,17 +456,149 @@ public partial class MainForm : Form
 
     private void StopSpeaking()
     {
-        // 强制中断语音输出，不考虑后续流程
+        _isAutoReading = false;
         _voice.SpeakAsyncCancelAll();
         _isSpeaking = false;
-        
-        // 确保语音引擎已完全停止
         while (_voice.State == SynthesizerState.Speaking)
         {
             System.Threading.Thread.Sleep(10);
         }
-        
         UpdateStatusLabel();
+    }
+
+    private async void StartAutoRead()
+    {
+        if (_isSpeaking)
+        {
+            StopSpeaking();
+            await Task.Delay(100);
+        }
+
+        _isAutoReading = true;
+        _statusLabel.Text = "自动逐行朗读模式...";
+        _statusLabel.ForeColor = Color.Blue;
+
+        int emptyLineCount = 0;
+
+        try
+        {
+            while (_isAutoReading)
+            {
+                bool readSuccess = await ReadCurrentSelectionAsync();
+
+                if (!readSuccess)
+                {
+                    emptyLineCount++;
+                    if (emptyLineCount >= 2)
+                    {
+                        _statusLabel.Text = "连续两次无效内容，自动朗读停止";
+                        _statusLabel.ForeColor = Color.Orange;
+                        _isAutoReading = false;
+                        break;
+                    }
+                }
+                else
+                {
+                    emptyLineCount = 0;
+                    
+                    // 等待朗读开始 (最多等待 1 秒)
+                    int waitStart = 0;
+                    while (_isAutoReading && _isSpeaking && _voice.State != SynthesizerState.Speaking && waitStart < 20)
+                    {
+                        await Task.Delay(50);
+                        waitStart++;
+                    }
+
+                    // 等待朗读结束
+                    while (_isAutoReading && _isSpeaking && _voice.State == SynthesizerState.Speaking)
+                    {
+                        await Task.Delay(50);
+                    }
+                    
+                    if (_isSpeaking) _isSpeaking = false;
+                    if (!_isAutoReading) break;
+                }
+
+                int delay = _autoReadDelay;
+                if (delay < 0) delay = 1000;
+                await Task.Delay(delay);
+
+                if (!_isAutoReading) break;
+
+                keybd_event(VK_DOWN, 0, KEYEVENTF_KEYDOWN, 0);
+                keybd_event(VK_DOWN, 0, KEYEVENTF_KEYUP, 0);
+                await Task.Delay(50);
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = $"自动朗读错误: {ex.Message}";
+            _statusLabel.ForeColor = Color.Red;
+            _isAutoReading = false;
+        }
+        finally
+        {
+            if (!_isAutoReading)
+            {
+                UpdateStatusLabel();
+            }
+        }
+    }
+
+    private async Task<bool> ReadCurrentSelectionAsync()
+    {
+        try
+        {
+            _previousClipboard = null;
+            try
+            {
+                var data = Clipboard.GetDataObject();
+                if (data != null) _previousClipboard = data;
+            }
+            catch {}
+
+            // 2. 复制
+            SimulateCtrlC();
+            await Task.Delay(150);
+
+            string text = "";
+            if (Clipboard.ContainsText())
+            {
+                text = Clipboard.GetText();
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false; 
+            }
+
+            if (_onlyReadFirstLine)
+            {
+                int newlineIndex = text.IndexOfAny(new[] { '\r', '\n' });
+                if (newlineIndex >= 0) text = text.Substring(0, newlineIndex);
+            }
+
+            if (_removeSpaces)
+            {
+                text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
+            }
+
+            string processedText = ApplyEscapeRules(text);
+
+            AddReadingRecord(processedText);
+            
+            _isSpeaking = true;
+            _statusLabel.Text = "正在朗读...";
+            _statusLabel.ForeColor = Color.Blue;
+
+            _voice.SpeakAsync(processedText);
+            
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private void SimulateCtrlC()
@@ -745,9 +611,9 @@ public partial class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        SaveConfig();
         UnregisterHotKey(this.Handle, HOTKEY_ID);
         UnregisterHotKey(this.Handle, STOP_HOTKEY_ID);
+        UnregisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID);
         _trayIcon.Visible = false;
         base.OnFormClosed(e);
     }
@@ -760,7 +626,6 @@ public partial class MainForm : Form
             Text = text.Length > 100 ? text.Substring(0, 100) + "..." : text
         };
 
-        // 超过限制则移除最旧的
         if (_readingHistory.Count >= _maxHistory)
         {
             _readingHistory.RemoveAt(0);
@@ -769,41 +634,27 @@ public partial class MainForm : Form
 
         _readingHistory.Add(record);
         _historyListBox.Items.Add($"[{record.Time:HH:mm:ss}] {record.Text}");
-        _historyListBox.TopIndex = _historyListBox.Items.Count - 1; // 滚动到最新
+        _historyListBox.TopIndex = _historyListBox.Items.Count - 1;
     }
 
-    private void EscapeRulesTextBox_TextChanged(object? sender, EventArgs e)
-    {
-        ParseEscapeRules();
-        if (!_isLoadingConfig) SaveConfig();
-    }
-
-    private void ParseEscapeRules()
+    private void ParseEscapeRules(string input)
     {
         _escapeRules.Clear();
         try
         {
-            string input = _escapeRulesTextBox.Text;
             if (string.IsNullOrWhiteSpace(input)) return;
-
-            // 解析规则："\u539f\u6587\u672c","\u66ff\u6362\u6587\u672c";
             var rules = input.Split(';');
             foreach (var rule in rules)
             {
                 var trimmedRule = rule.Trim();
                 if (string.IsNullOrWhiteSpace(trimmedRule)) continue;
-
-                // 匹配 "xxx","yyy" 格式
                 var match = System.Text.RegularExpressions.Regex.Match(trimmedRule, @"""([^""]*)"",""([^""]*)""");
                 if (match.Success)
                 {
                     string original = match.Groups[1].Value;
                     string replacement = match.Groups[2].Value;
-                    
-                    // 处理转义字符
                     original = original.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
                     replacement = replacement.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
-                    
                     if (!_escapeRules.ContainsKey(original))
                     {
                         _escapeRules.Add(original, replacement);
@@ -811,16 +662,12 @@ public partial class MainForm : Form
                 }
             }
         }
-        catch
-        {
-            // 解析失败，忽略
-        }
+        catch { }
     }
 
     private string ApplyEscapeRules(string text)
     {
         if (_escapeRules.Count == 0) return text;
-
         string result = text;
         foreach (var rule in _escapeRules)
         {
@@ -829,44 +676,91 @@ public partial class MainForm : Form
         return result;
     }
 
+    private string TryFixJson(string json)
+    {
+        try
+        {
+            // 尝试修复未加引号的 AutoReadHotkeyIndex 值
+            // 匹配 "AutoReadHotkeyIndex": Value (排除引号/数字/布尔/null开头)
+            var regex = new System.Text.RegularExpressions.Regex(
+                @"""AutoReadHotkeyIndex""\s*:\s*(?!""|\d|true|false|null)(?<val>[^,\r\n}]+)", 
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            
+            return regex.Replace(json, match => 
+            {
+                string val = match.Groups["val"].Value.Trim();
+                return $"\"AutoReadHotkeyIndex\": \"{val}\"";
+            });
+        }
+        catch
+        {
+            return json;
+        }
+    }
+
     private void SaveConfig()
     {
         try
         {
-            // 确保配置目录存在
             var configDir = Path.GetDirectoryName(_configPath);
             if (!string.IsNullOrEmpty(configDir) && !Directory.Exists(configDir))
             {
                 Directory.CreateDirectory(configDir);
             }
 
-            // 获取当前选择的发音人的实际名称
-            string voiceName = "";
-            if (_voiceCombo.SelectedIndex >= 0 && _voiceCombo.SelectedIndex < _installedVoices.Count)
+            string jsonContent = _configEditor.Text;
+            
+            // 验证 JSON 格式
+            var options = new JsonSerializerOptions
             {
-                voiceName = _installedVoices[_voiceCombo.SelectedIndex].VoiceInfo.Name;
-            }
-
-            var config = new AppConfig
-            {
-                HotkeyIndex = _keyCombo.SelectedIndex,
-                StopHotkeyIndex = _stopKeyCombo.SelectedIndex,
-                VoiceName = voiceName,
-                Rate = int.TryParse(_rateTextBox.Text, out int rate) ? rate : 0,
-                Volume = int.TryParse(_volumeTextBox.Text, out int volume) ? volume : 100,
-                OnlyReadFirstLine = _onlyReadFirstLineCheckBox.Checked,
-                ClearClipboard = _clearClipboardCheckBox.Checked,
-                RecordNumber = int.TryParse(_recordNumberTextBox.Text, out int recordNum) ? recordNum : 1000,
-                EscapeRules = _escapeRulesTextBox.Text,
-                TopMost = this.TopMost
+                PropertyNameCaseInsensitive = true,
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
             };
 
-            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(_configPath, json);
+            AppConfig? config = null;
+            try
+            {
+                config = JsonSerializer.Deserialize<AppConfig>(jsonContent, options);
+            }
+            catch (JsonException)
+            {
+                // 尝试自动修复常见错误 (如忘记加引号)
+                string fixedJson = TryFixJson(jsonContent);
+                if (fixedJson != jsonContent)
+                {
+                    try
+                    {
+                        config = JsonSerializer.Deserialize<AppConfig>(fixedJson, options);
+                        // 如果修复并解析成功，更新编辑器内容
+                        jsonContent = fixedJson;
+                        _configEditor.Text = fixedJson;
+                    }
+                    catch { /* 忽略第二次错误 */ }
+                }
+                
+                if (config == null) throw;
+            }
+            
+            if (config != null)
+            {
+                // 如果验证通过，写入文件
+                File.WriteAllText(_configPath, jsonContent);
+                
+                // 应用配置
+                ApplyConfig(config);
+                
+                _statusLabel.Text = "配置已保存并生效";
+                _statusLabel.ForeColor = Color.Green;
+            }
+            else
+            {
+                MessageBox.Show("JSON 格式错误，请检查！", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            // 保存失败，忽略
+            MessageBox.Show($"保存失败: {ex.Message}\r\n\r\n提示: 字符串值必须用双引号括起来，例如 \"Ctrl+Alt+S\"", "配置错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -877,6 +771,8 @@ public partial class MainForm : Form
             if (!File.Exists(_configPath)) return;
 
             var json = File.ReadAllText(_configPath);
+            _configEditor.Text = json; // 显示在编辑器中
+
             var options = new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true,
@@ -884,77 +780,120 @@ public partial class MainForm : Form
                 AllowTrailingCommas = true
             };
             var config = JsonSerializer.Deserialize<AppConfig>(json, options);
-            if (config == null) return;
-
-            // 恢复热键设置
-            if (config.HotkeyIndex >= 0 && config.HotkeyIndex < _keyCombo.Items.Count)
-            {
-                _keyCombo.SelectedIndex = config.HotkeyIndex;
-                _hotkeyKey = (uint)(0x70 + config.HotkeyIndex);
-            }
             
-            if (config.StopHotkeyIndex >= 0 && config.StopHotkeyIndex < _stopKeyCombo.Items.Count)
+            if (config != null)
             {
-                _stopKeyCombo.SelectedIndex = config.StopHotkeyIndex;
-                _stopHotkeyKey = (uint)(0x70 + config.StopHotkeyIndex);
-            }
-
-            // 恢复语音参数
-            if (config.Rate >= -10 && config.Rate <= 10)
-            {
-                _rateTextBox.Text = config.Rate.ToString();
-            }
-
-            if (config.Volume >= 0 && config.Volume <= 100)
-            {
-                _volumeTextBox.Text = config.Volume.ToString();
-            }
-
-            _onlyReadFirstLineCheckBox.Checked = config.OnlyReadFirstLine;
-            _clearClipboardCheckBox.Checked = config.ClearClipboard;
-
-            if (config.RecordNumber > 0)
-            {
-                _recordNumberTextBox.Text = config.RecordNumber.ToString();
-                _maxHistory = config.RecordNumber;
-            }
-
-            // 恢复转义规则
-            if (!string.IsNullOrEmpty(config.EscapeRules))
-            {
-                _escapeRulesTextBox.Text = config.EscapeRules;
-            }
-
-            // 恢复发音人（精确匹配 VoiceInfo.Name）
-            if (!string.IsNullOrEmpty(config.VoiceName))
-            {
-                for (int i = 0; i < _installedVoices.Count; i++)
-                {
-                    if (_installedVoices[i].VoiceInfo.Name == config.VoiceName)
-                    {
-                        _voiceCombo.SelectedIndex = i;
-                        break;
-                    }
-                }
-            }
-
-            // 恢复置顶状态
-            this.TopMost = config.TopMost;
-            if (this.TopMost)
-            {
-                _topMostButton.Text = "取消置顶";
-                _topMostButton.BackColor = Color.LightBlue;
-            }
-            else
-            {
-                _topMostButton.Text = "置顶";
-                _topMostButton.BackColor = SystemColors.Control;
+                ApplyConfig(config);
             }
         }
         catch
         {
-            // 加载失败，使用默认设置
+            // 加载失败
         }
+    }
+    
+    private void ApplyConfig(AppConfig config)
+    {
+        // 1. 热键设置
+        if (config.HotkeyIndex >= 0 && config.HotkeyIndex < 12)
+        {
+            _hotkeyKey = (uint)(0x70 + config.HotkeyIndex);
+        }
+        
+        if (config.StopHotkeyIndex >= 0 && config.StopHotkeyIndex < 12)
+        {
+            _stopHotkeyKey = (uint)(0x70 + config.StopHotkeyIndex);
+        }
+
+        // AutoReadHotkeyIndex logic
+        string? autoReadStr = null;
+        int autoReadIdx = -1;
+
+        if (config.AutoReadHotkeyIndex is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.String) autoReadStr = element.GetString();
+            else if (element.ValueKind == JsonValueKind.Number) autoReadIdx = element.GetInt32();
+        }
+        else if (config.AutoReadHotkeyIndex is string s) autoReadStr = s;
+        else if (config.AutoReadHotkeyIndex is int i) autoReadIdx = i;
+        else try { autoReadIdx = Convert.ToInt32(config.AutoReadHotkeyIndex); } catch { }
+
+        if (!string.IsNullOrEmpty(autoReadStr))
+        {
+            try
+            {
+                uint mods = 0;
+                uint key = 0;
+                var parts = autoReadStr.ToLower().Split('+');
+                foreach (var part in parts)
+                {
+                    var p = part.Trim();
+                    if (p == "ctrl" || p == "control") mods |= MOD_CONTROL;
+                    else if (p == "alt") mods |= MOD_ALT;
+                    else if (p == "shift") mods |= MOD_SHIFT;
+                    else
+                    {
+                        if (p.Length == 1) key = (uint)p.ToUpper()[0];
+                        else if (p.StartsWith("f") && int.TryParse(p.Substring(1), out int fNum))
+                        {
+                            if (fNum >= 1 && fNum <= 24) key = (uint)(0x70 + fNum - 1);
+                        }
+                    }
+                }
+
+                if (key != 0)
+                {
+                    _autoReadModifiers = mods;
+                    _autoReadHotkeyKey = key;
+                    _customAutoReadHotKey = autoReadStr;
+                }
+            }
+            catch { }
+        }
+        else if (autoReadIdx >= 0 && autoReadIdx < 12)
+        {
+            _autoReadModifiers = MOD_CONTROL | MOD_SHIFT;
+            _autoReadHotkeyKey = (uint)(0x70 + autoReadIdx);
+            _customAutoReadHotKey = $"Ctrl+Shift+F{autoReadIdx + 1}";
+        }
+
+        RegisterCurrentHotkey();
+
+        // 2. 语音参数
+        if (_voice != null)
+        {
+            if (config.Rate >= -10 && config.Rate <= 10) _voice.Rate = config.Rate;
+            if (config.Volume >= 0 && config.Volume <= 100) _voice.Volume = config.Volume;
+            
+            if (!string.IsNullOrEmpty(config.VoiceName))
+            {
+                try
+                {
+                    _voice.SelectVoice(config.VoiceName);
+                }
+                catch {}
+            }
+        }
+
+        // 3. 其他选项
+        _onlyReadFirstLine = config.OnlyReadFirstLine;
+        _clearClipboard = config.ClearClipboard;
+        _removeSpaces = config.RemoveSpaces;
+        _autoReadDelay = config.AutoReadDelay;
+        
+        if (config.RecordNumber > 0)
+        {
+            _maxHistory = config.RecordNumber;
+            // Trim history
+            while (_readingHistory.Count > _maxHistory)
+            {
+                _readingHistory.RemoveAt(0);
+                _historyListBox.Items.RemoveAt(0);
+            }
+        }
+
+        ParseEscapeRules(config.EscapeRules);
+        this.TopMost = config.TopMost;
     }
 }
 
@@ -963,6 +902,7 @@ public class AppConfig
 {
     public int HotkeyIndex { get; set; }
     public int StopHotkeyIndex { get; set; } = 1; // 默认 F2
+    public object AutoReadHotkeyIndex { get; set; } = 0; // 支持 string (自定义) 或 int (F1-F12 索引)
     public string VoiceName { get; set; } = "";
     public int Rate { get; set; }
     public int Volume { get; set; } = 100;
@@ -971,6 +911,8 @@ public class AppConfig
     public bool OnlyReadFirstLine { get; set; } = false;
     public bool ClearClipboard { get; set; } = true;
     public int RecordNumber { get; set; } = 1000;
+    public bool RemoveSpaces { get; set; } = false;
+    public int AutoReadDelay { get; set; } = 1000;
 }
 
 // 朗读记录类
