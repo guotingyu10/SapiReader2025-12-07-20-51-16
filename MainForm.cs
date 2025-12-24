@@ -73,7 +73,6 @@ public partial class MainForm : Form
 
     // 配置文件路径 - 使用项目根目录
     private string _configPath = "";
-    private bool _isLoadingConfig = false;
 
     public MainForm()
     {
@@ -90,14 +89,10 @@ public partial class MainForm : Form
             _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
         }
         
-        _isLoadingConfig = true;
-        
         InitializeComponent();
         InitializeVoice();
         InitializeTrayIcon();
         LoadConfig();
-        
-        _isLoadingConfig = false;
     }
 
     private void InitializeComponent()
@@ -358,15 +353,12 @@ public partial class MainForm : Form
 
     private async void HandleHotkey()
     {
-        if (_isSpeaking)
+        // 1. 立即中断之前的朗读 (提高响应速度)
+        if (_isSpeaking || _voice.State == SynthesizerState.Speaking)
         {
             _voice.SpeakAsyncCancelAll();
             _isSpeaking = false;
-            while (_voice.State == SynthesizerState.Speaking)
-            {
-                await Task.Delay(10);
-            }
-            UpdateStatusLabel();
+            // 不在这里等待，利用获取剪贴板的时间作为缓冲
         }
 
         try
@@ -379,13 +371,25 @@ public partial class MainForm : Form
             }
             catch {}
 
-            SimulateCtrlC();
-            await Task.Delay(150);
+            // 优化: 先清空剪贴板，以便检测新内容是否已复制
+            try { Clipboard.Clear(); } catch {}
 
+            SimulateCtrlC();
+            
+            // 优化: 轮询检查剪贴板，代替固定延迟 (提高响应速度)
             string text = "";
-            if (Clipboard.ContainsText())
+            for (int i = 0; i < 20; i++) // 最多等待 400ms
             {
-                text = Clipboard.GetText();
+                await Task.Delay(20);
+                if (Clipboard.ContainsText())
+                {
+                    string t = Clipboard.GetText();
+                    if (!string.IsNullOrWhiteSpace(t))
+                    {
+                        text = t;
+                        break;
+                    }
+                }
             }
 
             if (string.IsNullOrWhiteSpace(text))
@@ -420,6 +424,14 @@ public partial class MainForm : Form
                     else Clipboard.Clear();
                 }
                 catch {}
+            }
+
+            // 关键修复: 确保之前的朗读已完全停止 (解决长文本朗读时无法切换新内容的问题)
+            int safetyWait = 0;
+            while (_voice.State == SynthesizerState.Speaking && safetyWait < 50)
+            {
+                await Task.Delay(10);
+                safetyWait++;
             }
 
             _isSpeaking = true;
