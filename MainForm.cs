@@ -70,12 +70,14 @@ public partial class MainForm : Form
     
     // 转义字符规则
     private Dictionary<string, string> _escapeRules = new();
+    private List<KeyValuePair<string, string>> _escapeRulesOrdered = new();
 
     // 配置文件路径 - 使用项目根目录
     private string _configPath = "";
 
     public MainForm()
     {
+        Log("MainForm Constructor Started");
         // 计算配置文件路径
         // 优先查找当前工作目录（方便开发调试和便携使用）
         string currentDirConfig = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
@@ -90,9 +92,32 @@ public partial class MainForm : Form
         }
         
         InitializeComponent();
+        Log("InitializeComponent Done");
         InitializeVoice();
+        Log("InitializeVoice Done");
         InitializeTrayIcon();
+        Log("InitializeTrayIcon Done");
         LoadConfig();
+        Log("LoadConfig Done");
+    }
+
+    private void Log(string message)
+    {
+        try { File.AppendAllText("debug.log", $"[{DateTime.Now}] {message}\n"); } catch {}
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        Log("OnLoad Started");
+        base.OnLoad(e);
+        Log("OnLoad Done");
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        Log("OnShown Started");
+        base.OnShown(e);
+        Log("OnShown Done");
     }
 
     private void InitializeComponent()
@@ -649,29 +674,62 @@ public partial class MainForm : Form
         _historyListBox.TopIndex = _historyListBox.Items.Count - 1;
     }
 
-    private void ParseEscapeRules(string input)
+    private void LoadEscapeRules(object input)
     {
         _escapeRules.Clear();
+        _escapeRulesOrdered.Clear();
         try
         {
-            if (string.IsNullOrWhiteSpace(input)) return;
-            var rules = input.Split(';');
-            foreach (var rule in rules)
+            if (input is JsonElement element)
             {
-                var trimmedRule = rule.Trim();
-                if (string.IsNullOrWhiteSpace(trimmedRule)) continue;
-                var match = System.Text.RegularExpressions.Regex.Match(trimmedRule, @"""([^""]*)"",""([^""]*)""");
-                if (match.Success)
+                if (element.ValueKind == JsonValueKind.Object)
                 {
-                    string original = match.Groups[1].Value;
-                    string replacement = match.Groups[2].Value;
-                    original = original.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
-                    replacement = replacement.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
-                    if (!_escapeRules.ContainsKey(original))
+                    foreach (var property in element.EnumerateObject())
                     {
-                        _escapeRules.Add(original, replacement);
+                        string key = property.Name;
+                        string value = property.Value.GetString() ?? "";
+                        if (!_escapeRules.ContainsKey(key))
+                        {
+                            _escapeRules[key] = value;
+                        }
+                    }
+                    _escapeRulesOrdered = _escapeRules
+                        .OrderByDescending(kv => kv.Key.Length)
+                        .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                        .ToList();
+                    return;
+                }
+                else if (element.ValueKind == JsonValueKind.String)
+                {
+                    input = element.GetString() ?? "";
+                }
+            }
+
+            if (input is string strInput)
+            {
+                if (string.IsNullOrWhiteSpace(strInput)) return;
+                var rules = strInput.Split(';');
+                foreach (var rule in rules)
+                {
+                    var trimmedRule = rule.Trim();
+                    if (string.IsNullOrWhiteSpace(trimmedRule)) continue;
+                    var match = System.Text.RegularExpressions.Regex.Match(trimmedRule, @"""([^""]*)"",""([^""]*)""");
+                    if (match.Success)
+                    {
+                        string original = match.Groups[1].Value;
+                        string replacement = match.Groups[2].Value;
+                        original = original.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
+                        replacement = replacement.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
+                        if (!_escapeRules.ContainsKey(original))
+                        {
+                            _escapeRules[original] = replacement;
+                        }
                     }
                 }
+                _escapeRulesOrdered = _escapeRules
+                    .OrderByDescending(kv => kv.Key.Length)
+                    .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                    .ToList();
             }
         }
         catch { }
@@ -679,9 +737,16 @@ public partial class MainForm : Form
 
     private string ApplyEscapeRules(string text)
     {
-        if (_escapeRules.Count == 0) return text;
+        if (_escapeRulesOrdered.Count == 0 && _escapeRules.Count > 0)
+        {
+            _escapeRulesOrdered = _escapeRules
+                .OrderByDescending(kv => kv.Key.Length)
+                .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                .ToList();
+        }
+        if (_escapeRulesOrdered.Count == 0) return text;
         string result = text;
-        foreach (var rule in _escapeRules)
+        foreach (var rule in _escapeRulesOrdered)
         {
             result = result.Replace(rule.Key, rule.Value);
         }
@@ -904,7 +969,7 @@ public partial class MainForm : Form
             }
         }
 
-        ParseEscapeRules(config.EscapeRules);
+        LoadEscapeRules(config.EscapeRules);
         this.TopMost = config.TopMost;
     }
 }
@@ -918,7 +983,7 @@ public class AppConfig
     public string VoiceName { get; set; } = "";
     public int Rate { get; set; }
     public int Volume { get; set; } = 100;
-    public string EscapeRules { get; set; } = "";
+    public object EscapeRules { get; set; } = "";
     public bool TopMost { get; set; } = false;
     public bool OnlyReadFirstLine { get; set; } = false;
     public bool ClearClipboard { get; set; } = true;
