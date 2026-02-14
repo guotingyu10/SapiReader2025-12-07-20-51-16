@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Speech.Synthesis;
 using System.Text.Json;
+using System.Diagnostics;
 
 namespace SapiReader;
 
@@ -74,6 +75,9 @@ public partial class MainForm : Form
 
     // 配置文件路径 - 使用项目根目录
     private string _configPath = "";
+    private FileSystemWatcher? _configWatcher;
+    private bool _restartScheduled = false;
+    private bool _selfSaving = false;
 
     public MainForm()
     {
@@ -99,6 +103,7 @@ public partial class MainForm : Form
         Log("InitializeTrayIcon Done");
         LoadConfig();
         Log("LoadConfig Done");
+        InitializeConfigWatcher();
     }
 
     private void Log(string message)
@@ -147,6 +152,15 @@ public partial class MainForm : Form
             Font = new Font("Consolas", 10F),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
+        var editorMenu = new ContextMenuStrip();
+        var openDefault = new ToolStripMenuItem("用默认程序打开 config.json");
+        openDefault.Click += (s, e) => OpenConfigWithDefault();
+        var openWith = new ToolStripMenuItem("选择其他程序打开 config.json");
+        openWith.Click += (s, e) => OpenConfigWithDialog();
+        var openFolder = new ToolStripMenuItem("在资源管理器中定位 config.json");
+        openFolder.Click += (s, e) => OpenConfigInFolder();
+        editorMenu.Items.AddRange(new ToolStripItem[] { openDefault, openWith, openFolder });
+        _configEditor.ContextMenuStrip = editorMenu;
 
         // 2. 按钮区域
         _saveConfigButton = new Button
@@ -822,7 +836,9 @@ public partial class MainForm : Form
             if (config != null)
             {
                 // 如果验证通过，写入文件
+                _selfSaving = true;
                 File.WriteAllText(_configPath, jsonContent);
+                _selfSaving = false;
                 
                 // 应用配置
                 ApplyConfig(config);
@@ -867,6 +883,111 @@ public partial class MainForm : Form
         {
             // 加载失败
         }
+    }
+    
+    private void InitializeConfigWatcher()
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_configPath)) return;
+            var dir = Path.GetDirectoryName(_configPath);
+            var name = Path.GetFileName(_configPath);
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(name)) return;
+            _configWatcher?.Dispose();
+            _configWatcher = new FileSystemWatcher(dir, name)
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName
+            };
+            _configWatcher.Changed += (_, __) => OnExternalConfigChanged();
+            _configWatcher.Created += (_, __) => OnExternalConfigChanged();
+            _configWatcher.Renamed += (_, __) => OnExternalConfigChanged();
+            _configWatcher.EnableRaisingEvents = true;
+        }
+        catch { }
+    }
+    
+    private void OnExternalConfigChanged()
+    {
+        if (_selfSaving) return;
+        if (_restartScheduled) return;
+        _restartScheduled = true;
+        Task.Run(async () =>
+        {
+            await Task.Delay(800);
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        Application.Restart();
+                    }
+                    catch
+                    {
+                        try
+                        {
+                            var exe = Application.ExecutablePath;
+                            var args = string.Join(" ", Environment.GetCommandLineArgs().Skip(1).Select(QuoteArg));
+                            Process.Start(new ProcessStartInfo
+                            {
+                                FileName = exe,
+                                Arguments = args,
+                                UseShellExecute = true
+                            });
+                        }
+                        catch { }
+                    }
+                    try { Environment.Exit(0); } catch { }
+                }));
+            }
+            catch
+            {
+                try { Environment.Exit(0); } catch { }
+            }
+        });
+    }
+    
+    private static string QuoteArg(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "\"\"";
+        if (s.Any(char.IsWhiteSpace) || s.Contains('"')) return $"\"{s.Replace("\"", "\\\"")}\"";
+        return s;
+    }
+    
+    private void OpenConfigWithDefault()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _configPath,
+                UseShellExecute = true
+            });
+        }
+        catch { }
+    }
+    
+    private void OpenConfigWithDialog()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "rundll32.exe",
+                Arguments = $"shell32.dll,OpenAs_RunDLL \"{_configPath}\"",
+                UseShellExecute = true
+            });
+        }
+        catch { }
+    }
+    
+    private void OpenConfigInFolder()
+    {
+        try
+        {
+            Process.Start("explorer.exe", $"/select,\"{_configPath}\"");
+        }
+        catch { }
     }
     
     private void ApplyConfig(AppConfig config)
