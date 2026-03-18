@@ -1,8 +1,8 @@
 # .NET 编译输出
 bin/
 obj/
-publish
-Qwen3-TTS-12Hz-1.7B-CustomVoice
+publish/
+Qwen3-TTS-12Hz-1.7B-CustomVoice/
 # Visual Studio 缓存/选项
 .vs/
 *.suo
