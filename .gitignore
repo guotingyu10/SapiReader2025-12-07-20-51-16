@@ -1,6 +1,7 @@
 # .NET 编译输出
 bin/
 obj/
+publish
 
 # Visual Studio 缓存/选项
 .vs/

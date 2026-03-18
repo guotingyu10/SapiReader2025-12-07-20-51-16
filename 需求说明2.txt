@@ -1,0 +1,21 @@
+为项目添加2种发音人
+用于朗读中英文混合内容;
+出现汉字切换到中文发音人;
+出现字母切换到英文发音人;dotnet run
+
+如何降低中英文之间朗读的时间差;
+
+
+为这个项目添加防止扬声器休眠的功能(持续播放无声声音)
+
+
+dotnet run
+
+
+dotnet publish -c Release -o ./publish
+dotnet publish
+ -c Release -o ./publish
+
+
+
+

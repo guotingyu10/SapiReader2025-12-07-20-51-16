@@ -2,6 +2,8 @@ using System.Runtime.InteropServices;
 using System.Speech.Synthesis;
 using System.Text.Json;
 using System.Diagnostics;
+using System.Media;
+using System.Text.Json.Serialization;
 
 namespace SapiReader;
 
@@ -42,6 +44,17 @@ public partial class MainForm : Form
     private bool _isAutoReading = false;
     private IDataObject? _previousClipboard = null;
     private List<InstalledVoice> _installedVoices = new();
+    private string _chineseVoiceName = "";
+    private string _englishVoiceName = "";
+    private bool _autoSwitchVoice = true;
+    private int _chineseVoiceRate = 0;
+    private int _englishVoiceRate = 0;
+    private int _mixedChineseMinChars = 2;
+    private int _mixedEnglishMinLetters = 3;
+    private bool _warmUpVoices = true;
+    private bool _preventSpeakerSleep = false;
+    private SoundPlayer? _speakerKeepAlivePlayer;
+    private MemoryStream? _speakerKeepAliveStream;
 
     // 朗读记录（最多1000条，超出覆盖）
     private int _maxHistory = 1000;
@@ -270,12 +283,12 @@ public partial class MainForm : Form
                          _statusLabel.Text = $"已复制发音人: \"{name}\"";
                          _statusLabel.ForeColor = Color.Green;
                          
-                         // 简单的视觉反馈，让用户知道操作成功
-                         if (_configEditor.Text.Contains("\"VoiceName\": \"\""))
-                         {
-                              // 如果是空配置，提示用户可以粘贴
-                              MessageBox.Show($"已复制: {name}\r\n请在 VoiceName 字段的双引号中粘贴 (Ctrl+V)", "复制成功");
-                         }
+                        if (_configEditor.Text.Contains("\"ChineseVoiceName\": \"\"")
+                            || _configEditor.Text.Contains("\"EnglishVoiceName\": \"\"")
+                            || _configEditor.Text.Contains("\"VoiceName\": \"\""))
+                        {
+                            MessageBox.Show($"已复制: {name}\r\n可粘贴到 ChineseVoiceName / EnglishVoiceName / VoiceName 字段的双引号中 (Ctrl+V)", "复制成功");
+                        }
                      }
                      catch (Exception ex)
                      {
@@ -477,7 +490,7 @@ public partial class MainForm : Form
             _statusLabel.Text = "正在朗读...";
             _statusLabel.ForeColor = Color.Blue;
 
-            _voice.SpeakAsync(processedText);
+            SpeakText(processedText);
             
             while (_isSpeaking && _voice.State == SynthesizerState.Speaking)
             {
@@ -642,7 +655,7 @@ public partial class MainForm : Form
             _statusLabel.Text = "正在朗读...";
             _statusLabel.ForeColor = Color.Blue;
 
-            _voice.SpeakAsync(processedText);
+            SpeakText(processedText);
             
             return true;
         }
@@ -666,6 +679,7 @@ public partial class MainForm : Form
         UnregisterHotKey(this.Handle, STOP_HOTKEY_ID);
         UnregisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID);
         _trayIcon.Visible = false;
+        StopSpeakerKeepAlive();
         base.OnFormClosed(e);
     }
 
@@ -1060,7 +1074,7 @@ public partial class MainForm : Form
         // 2. 语音参数
         if (_voice != null)
         {
-            if (config.Rate >= -10 && config.Rate <= 10) _voice.Rate = config.Rate;
+            _voice.Rate = ClampRate(config.Rate);
             if (config.Volume >= 0 && config.Volume <= 100) _voice.Volume = config.Volume;
             
             if (!string.IsNullOrEmpty(config.VoiceName))
@@ -1092,6 +1106,492 @@ public partial class MainForm : Form
 
         LoadEscapeRules(config.EscapeRules);
         this.TopMost = config.TopMost;
+
+        _autoSwitchVoice = config.AutoSwitchVoice;
+        var desiredChinese = string.IsNullOrWhiteSpace(config.ChineseVoiceName) ? config.VoiceName : config.ChineseVoiceName;
+        var desiredEnglish = string.IsNullOrWhiteSpace(config.EnglishVoiceName) ? TryGetDefaultEnglishVoiceName() : config.EnglishVoiceName;
+        _chineseVoiceName = ResolveVoiceName(desiredChinese);
+        _englishVoiceName = ResolveVoiceName(desiredEnglish);
+        _chineseVoiceRate = ClampRate(config.ChineseVoiceRate ?? config.Rate);
+        _englishVoiceRate = ClampRate(config.EnglishVoiceRate ?? config.Rate);
+        _mixedChineseMinChars = config.MixedChineseMinChars is int zhMin ? Math.Max(1, zhMin) : 2;
+        _mixedEnglishMinLetters = config.MixedEnglishMinLetters is int enMin ? Math.Max(1, enMin) : 3;
+        _warmUpVoices = config.WarmUpVoices ?? true;
+        if (_warmUpVoices)
+        {
+            try
+            {
+                BeginInvoke(new Action(() => WarmUpVoices()));
+            }
+            catch { }
+        }
+
+        _preventSpeakerSleep = config.PreventSpeakerFromGoingIntoSleepMode ?? false;
+        if (_preventSpeakerSleep) StartSpeakerKeepAlive();
+        else StopSpeakerKeepAlive();
+    }
+
+    private void SpeakText(string text)
+    {
+        if (!_autoSwitchVoice)
+        {
+            _voice.SpeakAsync(text);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_chineseVoiceName) || string.IsNullOrWhiteSpace(_englishVoiceName))
+        {
+            _voice.SpeakAsync(text);
+            return;
+        }
+
+        bool hasChinese = ContainsChinese(text);
+        bool hasEnglish = ContainsLatinLetter(text);
+        if (hasChinese && !hasEnglish)
+        {
+            SelectVoiceSafe(_chineseVoiceName);
+            _voice.Rate = _chineseVoiceRate;
+            _voice.SpeakAsync(text);
+            return;
+        }
+        if (hasEnglish && !hasChinese)
+        {
+            SelectVoiceSafe(_englishVoiceName);
+            _voice.Rate = _englishVoiceRate;
+            _voice.SpeakAsync(text);
+            return;
+        }
+        if (!hasChinese && !hasEnglish)
+        {
+            _voice.SpeakAsync(text);
+            return;
+        }
+
+        var prompt = BuildMixedVoicePrompt(text);
+        if (prompt == null)
+        {
+            _voice.SpeakAsync(text);
+            return;
+        }
+
+        _voice.SpeakAsync(prompt);
+    }
+
+    private PromptBuilder? BuildMixedVoicePrompt(string text)
+    {
+        try
+        {
+            var segments = SplitByLanguage(text);
+            segments = SmoothSegments(segments);
+            if (segments.Count == 0) return null;
+
+            var prompt = new PromptBuilder();
+            foreach (var segment in segments)
+            {
+                var voiceName = segment.Kind == TextKind.Chinese ? _chineseVoiceName : _englishVoiceName;
+                var rate = segment.Kind == TextKind.Chinese ? _chineseVoiceRate : _englishVoiceRate;
+                if (string.IsNullOrWhiteSpace(voiceName))
+                {
+                    prompt.AppendText(segment.Text);
+                    continue;
+                }
+
+                try
+                {
+                    prompt.StartVoice(voiceName);
+                    var style = new PromptStyle
+                    {
+                        Rate = MapPromptRate(rate)
+                    };
+                    prompt.StartStyle(style);
+                    prompt.AppendText(segment.Text);
+                    prompt.EndStyle();
+                    prompt.EndVoice();
+                }
+                catch
+                {
+                    prompt.AppendText(segment.Text);
+                }
+            }
+            return prompt;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private enum TextKind
+    {
+        Chinese,
+        English
+    }
+
+    private readonly struct TextSegment
+    {
+        public TextSegment(TextKind kind, string text)
+        {
+            Kind = kind;
+            Text = text;
+        }
+
+        public TextKind Kind { get; }
+        public string Text { get; }
+    }
+
+    private List<TextSegment> SplitByLanguage(string text)
+    {
+        var segments = new List<TextSegment>();
+
+        TextKind? currentKind = null;
+        var current = new System.Text.StringBuilder();
+        var pendingNeutral = new System.Text.StringBuilder();
+
+        foreach (var ch in text)
+        {
+            var kind = GetCharKind(ch);
+            if (kind == null)
+            {
+                if (currentKind == null) pendingNeutral.Append(ch);
+                else current.Append(ch);
+                continue;
+            }
+
+            if (currentKind == null)
+            {
+                currentKind = kind;
+                if (pendingNeutral.Length > 0)
+                {
+                    current.Append(pendingNeutral);
+                    pendingNeutral.Clear();
+                }
+                current.Append(ch);
+                continue;
+            }
+
+            if (currentKind.Value == kind.Value)
+            {
+                current.Append(ch);
+                continue;
+            }
+
+            if (current.Length > 0)
+            {
+                segments.Add(new TextSegment(currentKind.Value, current.ToString()));
+                current.Clear();
+            }
+            currentKind = kind;
+            current.Append(ch);
+        }
+
+        if (pendingNeutral.Length > 0)
+        {
+            if (currentKind != null) current.Append(pendingNeutral);
+            else return segments;
+        }
+
+        if (currentKind != null && current.Length > 0)
+        {
+            segments.Add(new TextSegment(currentKind.Value, current.ToString()));
+        }
+
+        return segments;
+    }
+
+    private static TextKind? GetCharKind(char ch)
+    {
+        if (IsChineseChar(ch)) return TextKind.Chinese;
+        if (IsLatinLetter(ch)) return TextKind.English;
+        return null;
+    }
+
+    private static bool IsLatinLetter(char ch) => (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+
+    private static bool IsChineseChar(char ch)
+    {
+        return (ch >= '\u4E00' && ch <= '\u9FFF')
+            || (ch >= '\u3400' && ch <= '\u4DBF')
+            || (ch >= '\uF900' && ch <= '\uFAFF')
+            || (ch >= '\u2E80' && ch <= '\u2EFF')
+            || (ch >= '\u3000' && ch <= '\u303F');
+    }
+
+    private static bool ContainsChinese(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (IsChineseChar(ch)) return true;
+        }
+        return false;
+    }
+
+    private static bool ContainsLatinLetter(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (IsLatinLetter(ch)) return true;
+        }
+        return false;
+    }
+
+    private string TryGetDefaultEnglishVoiceName()
+    {
+        try
+        {
+            foreach (var voice in _installedVoices)
+            {
+                if (voice.VoiceInfo.Culture.TwoLetterISOLanguageName.Equals("en", StringComparison.OrdinalIgnoreCase))
+                {
+                    return voice.VoiceInfo.Name;
+                }
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    private void WarmUpVoices()
+    {
+        try
+        {
+            using var warm = new SpeechSynthesizer();
+            warm.SetOutputToNull();
+
+            if (!string.IsNullOrWhiteSpace(_chineseVoiceName))
+            {
+                try
+                {
+                    warm.SelectVoice(_chineseVoiceName);
+                    warm.Rate = _chineseVoiceRate;
+                    warm.Speak(" ");
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrWhiteSpace(_englishVoiceName))
+            {
+                try
+                {
+                    warm.SelectVoice(_englishVoiceName);
+                    warm.Rate = _englishVoiceRate;
+                    warm.Speak(" ");
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    private void StartSpeakerKeepAlive()
+    {
+        try
+        {
+            if (_speakerKeepAlivePlayer != null) return;
+
+            _speakerKeepAliveStream = new MemoryStream(CreateNearSilentWavBytes(sampleRate: 16000, seconds: 2));
+            _speakerKeepAlivePlayer = new SoundPlayer(_speakerKeepAliveStream);
+            _speakerKeepAlivePlayer.Load();
+            _speakerKeepAlivePlayer.PlayLooping();
+        }
+        catch
+        {
+            StopSpeakerKeepAlive();
+        }
+    }
+
+    private void StopSpeakerKeepAlive()
+    {
+        try { _speakerKeepAlivePlayer?.Stop(); } catch { }
+        try { _speakerKeepAlivePlayer?.Dispose(); } catch { }
+        _speakerKeepAlivePlayer = null;
+        try { _speakerKeepAliveStream?.Dispose(); } catch { }
+        _speakerKeepAliveStream = null;
+    }
+
+    private static byte[] CreateNearSilentWavBytes(int sampleRate, int seconds)
+    {
+        if (sampleRate <= 0) sampleRate = 16000;
+        if (seconds <= 0) seconds = 1;
+
+        short channels = 1;
+        short bitsPerSample = 16;
+        short blockAlign = (short)(channels * (bitsPerSample / 8));
+        int byteRate = sampleRate * blockAlign;
+        int sampleCount = sampleRate * seconds;
+        int dataSize = sampleCount * blockAlign;
+        int riffSize = 36 + dataSize;
+
+        var bytes = new byte[44 + dataSize];
+        int offset = 0;
+
+        void WriteAscii(string s)
+        {
+            for (int i = 0; i < s.Length; i++) bytes[offset++] = (byte)s[i];
+        }
+
+        void WriteInt32(int v)
+        {
+            bytes[offset++] = (byte)(v & 0xFF);
+            bytes[offset++] = (byte)((v >> 8) & 0xFF);
+            bytes[offset++] = (byte)((v >> 16) & 0xFF);
+            bytes[offset++] = (byte)((v >> 24) & 0xFF);
+        }
+
+        void WriteInt16(short v)
+        {
+            bytes[offset++] = (byte)(v & 0xFF);
+            bytes[offset++] = (byte)((v >> 8) & 0xFF);
+        }
+
+        WriteAscii("RIFF");
+        WriteInt32(riffSize);
+        WriteAscii("WAVE");
+        WriteAscii("fmt ");
+        WriteInt32(16);
+        WriteInt16(1);
+        WriteInt16(channels);
+        WriteInt32(sampleRate);
+        WriteInt32(byteRate);
+        WriteInt16(blockAlign);
+        WriteInt16(bitsPerSample);
+        WriteAscii("data");
+        WriteInt32(dataSize);
+
+        short amp = 1;
+        for (int i = 0; i < sampleCount; i++)
+        {
+            short sample = (short)((i & 1) == 0 ? amp : -amp);
+            WriteInt16(sample);
+        }
+
+        return bytes;
+    }
+
+    private string ResolveVoiceName(string desired)
+    {
+        if (string.IsNullOrWhiteSpace(desired)) return "";
+        try
+        {
+            var desiredTrim = desired.Trim();
+            var exact = _installedVoices.FirstOrDefault(v => string.Equals(v.VoiceInfo.Name, desiredTrim, StringComparison.OrdinalIgnoreCase));
+            if (exact != null) return exact.VoiceInfo.Name;
+
+            var startsWith = _installedVoices.FirstOrDefault(v => v.VoiceInfo.Name.StartsWith(desiredTrim, StringComparison.OrdinalIgnoreCase));
+            if (startsWith != null) return startsWith.VoiceInfo.Name;
+
+            var contains = _installedVoices.FirstOrDefault(v => v.VoiceInfo.Name.IndexOf(desiredTrim, StringComparison.OrdinalIgnoreCase) >= 0);
+            if (contains != null) return contains.VoiceInfo.Name;
+        }
+        catch { }
+        return desired.Trim();
+    }
+
+    private void SelectVoiceSafe(string voiceName)
+    {
+        if (string.IsNullOrWhiteSpace(voiceName)) return;
+        try { _voice.SelectVoice(voiceName); } catch { }
+    }
+
+    private static int ClampRate(int rate)
+    {
+        if (rate < -10) return -10;
+        if (rate > 10) return 10;
+        return rate;
+    }
+
+    private static PromptRate MapPromptRate(int rate)
+    {
+        if (rate <= -6) return PromptRate.ExtraSlow;
+        if (rate <= -2) return PromptRate.Slow;
+        if (rate <= 1) return PromptRate.Medium;
+        if (rate <= 5) return PromptRate.Fast;
+        return PromptRate.ExtraFast;
+    }
+
+    private List<TextSegment> SmoothSegments(List<TextSegment> segments)
+    {
+        if (segments.Count <= 1) return segments;
+
+        string leading = "";
+        int startIndex = 0;
+
+        if (segments.Count > 0)
+        {
+            var first = segments[0];
+            if (first.Kind == TextKind.Chinese && CountChineseChars(first.Text) < _mixedChineseMinChars)
+            {
+                leading = first.Text;
+                startIndex = 1;
+            }
+            else if (first.Kind == TextKind.English && CountLatinLetters(first.Text) < _mixedEnglishMinLetters)
+            {
+                leading = first.Text;
+                startIndex = 1;
+            }
+        }
+
+        var result = new List<TextSegment>();
+        for (int i = startIndex; i < segments.Count; i++)
+        {
+            var seg = segments[i];
+            if (result.Count == 0 && !string.IsNullOrEmpty(leading))
+            {
+                seg = new TextSegment(seg.Kind, leading + seg.Text);
+                leading = "";
+            }
+
+            bool isShort = seg.Kind == TextKind.Chinese
+                ? CountChineseChars(seg.Text) < _mixedChineseMinChars
+                : CountLatinLetters(seg.Text) < _mixedEnglishMinLetters;
+
+            if (isShort && result.Count > 0)
+            {
+                var prev = result[result.Count - 1];
+                result[result.Count - 1] = new TextSegment(prev.Kind, prev.Text + seg.Text);
+                continue;
+            }
+
+            if (result.Count > 0)
+            {
+                var prev = result[result.Count - 1];
+                if (prev.Kind == seg.Kind)
+                {
+                    result[result.Count - 1] = new TextSegment(prev.Kind, prev.Text + seg.Text);
+                    continue;
+                }
+            }
+
+            result.Add(seg);
+        }
+
+        if (!string.IsNullOrEmpty(leading))
+        {
+            if (result.Count == 0) return segments;
+            var first = result[0];
+            result[0] = new TextSegment(first.Kind, leading + first.Text);
+        }
+
+        return result;
+    }
+
+    private static int CountLatinLetters(string text)
+    {
+        int count = 0;
+        foreach (var ch in text)
+        {
+            if (IsLatinLetter(ch)) count++;
+        }
+        return count;
+    }
+
+    private static int CountChineseChars(string text)
+    {
+        int count = 0;
+        foreach (var ch in text)
+        {
+            if (IsChineseChar(ch)) count++;
+        }
+        return count;
     }
 }
 
@@ -1102,7 +1602,17 @@ public class AppConfig
     public int StopHotkeyIndex { get; set; } = 1; // 默认 F2
     public object AutoReadHotkeyIndex { get; set; } = 0; // 支持 string (自定义) 或 int (F1-F12 索引)
     public string VoiceName { get; set; } = "";
+    public string ChineseVoiceName { get; set; } = "";
+    public string EnglishVoiceName { get; set; } = "";
+    public bool AutoSwitchVoice { get; set; } = true;
     public int Rate { get; set; }
+    public int? ChineseVoiceRate { get; set; }
+    public int? EnglishVoiceRate { get; set; }
+    public int? MixedChineseMinChars { get; set; }
+    public int? MixedEnglishMinLetters { get; set; }
+    public bool? WarmUpVoices { get; set; }
+    [JsonPropertyName("Prevent the speaker from going into sleep mode")]
+    public bool? PreventSpeakerFromGoingIntoSleepMode { get; set; }
     public int Volume { get; set; } = 100;
     public object EscapeRules { get; set; } = "";
     public bool TopMost { get; set; } = false;
