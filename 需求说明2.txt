@@ -42,3 +42,14 @@ dotnet build .\SapiReader.csproj -c Release
 
 
 
+git status
+
+git remote -v
+
+git remote set-url origin https://github.com/guotingyu10/SapiReader2025-12-07-20-51-16.git 
+git add . 
+git commit -m "Update extension with jump fix" && git push -f origin main
+
+git status; git log -1 --stat
+
+git remote -v
