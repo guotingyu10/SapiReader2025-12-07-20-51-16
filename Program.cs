@@ -16,6 +16,12 @@ static class Program
             LogException(e.Exception, "ThreadException");
         };
 
+        TaskScheduler.UnobservedTaskException += (sender, e) =>
+        {
+            LogException(e.Exception, "UnobservedTaskException");
+            e.SetObserved();
+        };
+
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
         try

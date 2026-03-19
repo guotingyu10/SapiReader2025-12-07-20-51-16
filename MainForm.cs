@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Speech.AudioFormat;
 using System.Speech.Synthesis;
 using System.Text.Json;
 using System.Diagnostics;
@@ -112,6 +113,9 @@ public partial class MainForm : Form
     private int _mixedChineseMinChars = 2;
     private int _mixedEnglishMinLetters = 3;
     private bool _mixedGranularOutput = true;
+    private double _pronunciationInAdvanceSeconds = 0.0;
+    private double _pronunciationEnglishInAdvanceSeconds = 0.0;
+    private double _pronunciationChineseInAdvanceSeconds = 0.0;
     private bool _warmUpVoices = true;
     private bool _preventSpeakerSleep = false;
     private SoundPlayer? _speakerKeepAlivePlayer;
@@ -122,6 +126,8 @@ public partial class MainForm : Form
     private int _prebufferMaxSegmentChars = 200;
     private CancellationTokenSource? _bufferedPlaybackCts;
     private SoundPlayer? _bufferedCurrentPlayer;
+    private SoundPlayer? _bufferedReusablePlayer;
+    private WaveOutPlayer? _bufferedWavePlayer;
     private int _forceResetSynthAfterStopMs = 800;
     private AppConfig? _lastAppliedConfig;
     private CancellationTokenSource? _stopResetCts;
@@ -1651,8 +1657,11 @@ public partial class MainForm : Form
         try { _bufferedPlaybackCts?.Dispose(); } catch { }
         _bufferedPlaybackCts = null;
 
+        var wavePlayer = Interlocked.Exchange(ref _bufferedWavePlayer, null);
+        Log($"StopBufferedPlayback wavePlayer={(wavePlayer != null)}");
+        try { wavePlayer?.Stop(); } catch { }
+
         try { _bufferedCurrentPlayer?.Stop(); } catch { }
-        try { _bufferedCurrentPlayer?.Dispose(); } catch { }
         _bufferedCurrentPlayer = null;
     }
 
@@ -2272,12 +2281,50 @@ public partial class MainForm : Form
         _prebufferMixedAudio = config.PrebufferMixedAudio ?? false;
         _prebufferMinTextLength = config.PrebufferMinTextLength is int minLen ? Math.Max(1, minLen) : 400;
         _prebufferMaxSegmentChars = config.PrebufferMaxSegmentChars is int maxChars ? Math.Max(50, maxChars) : 200;
+        try
+        {
+            double sec = config.PronunciationInAdvance ?? 0.0;
+            if (double.IsNaN(sec) || double.IsInfinity(sec)) sec = 0.0;
+            if (sec < 0) sec = 0.0;
+            if (sec > 0.25) sec = 0.25;
+            _pronunciationInAdvanceSeconds = sec;
+        }
+        catch
+        {
+            _pronunciationInAdvanceSeconds = 0.0;
+        }
+
+        try
+        {
+            double sec = config.PronunciationEnglishInAdvance ?? config.PronunciationInAdvance ?? 0.0;
+            if (double.IsNaN(sec) || double.IsInfinity(sec)) sec = 0.0;
+            if (sec < 0) sec = 0.0;
+            if (sec > 0.25) sec = 0.25;
+            _pronunciationEnglishInAdvanceSeconds = sec;
+        }
+        catch
+        {
+            _pronunciationEnglishInAdvanceSeconds = _pronunciationInAdvanceSeconds;
+        }
+
+        try
+        {
+            double sec = config.PronunciationChineseInAdvance ?? config.PronunciationInAdvance ?? 0.0;
+            if (double.IsNaN(sec) || double.IsInfinity(sec)) sec = 0.0;
+            if (sec < 0) sec = 0.0;
+            if (sec > 0.25) sec = 0.25;
+            _pronunciationChineseInAdvanceSeconds = sec;
+        }
+        catch
+        {
+            _pronunciationChineseInAdvanceSeconds = _pronunciationInAdvanceSeconds;
+        }
 
         _logEnabled = config.SapiReaderLog ?? true;
 
         Log($"ApplyConfig readKey={VkToDisplay(_hotkeyKey)} stopKey={VkToDisplay(_stopHotkeyKey)} autoRead={_customAutoReadHotKey}");
         Log($"ApplyConfig zhVoice={_chineseVoiceName} enVoice={_englishVoiceName} zhRate={_chineseVoiceRate} enRate={_englishVoiceRate}");
-        Log($"ApplyConfig prebufferMixed={_prebufferMixedAudio} minLen={_prebufferMinTextLength} maxSeg={_prebufferMaxSegmentChars} keepAlive={_preventSpeakerSleep}");
+        Log($"ApplyConfig prebufferMixed={_prebufferMixedAudio} minLen={_prebufferMinTextLength} maxSeg={_prebufferMaxSegmentChars} keepAlive={_preventSpeakerSleep} advance={_pronunciationInAdvanceSeconds:0.###} enAdvance={_pronunciationEnglishInAdvanceSeconds:0.###} zhAdvance={_pronunciationChineseInAdvanceSeconds:0.###}");
 
         var oldStandby = Interlocked.Exchange(ref _standbyVoice, null);
         DisposeOldSynthAsync(oldStandby);
@@ -2302,7 +2349,7 @@ public partial class MainForm : Form
 
         bool hasChinese = ContainsChinese(text);
         bool hasEnglish = ContainsLatinLetter(text);
-        if (_prebufferMixedAudio && hasChinese && hasEnglish && text.Length >= _prebufferMinTextLength)
+        if (hasChinese && hasEnglish)
         {
             StartBufferedMixedPlayback(text);
             return;
@@ -2363,31 +2410,205 @@ public partial class MainForm : Form
 
     private void BufferedPlaybackWorker(string text, CancellationToken token)
     {
+        WaveOutPlayer? player = null;
+        byte[]? carryTail = null;
+        WaveFormat carryFmt = default;
         try
         {
             var segments = SmoothSegments(SplitByLanguage(text));
+            segments = NormalizeMixedBoundaryWhitespace(segments);
             segments = SplitLongSegments(segments, _prebufferMaxSegmentChars);
             if (segments.Count == 0) return;
 
-            Task<PreparedAudio?> nextTask = Task.Run(() => SynthesizeSegmentAudio(segments[0], token), token);
+            const int prefetchDepth = 3;
+            var tasks = new Queue<Task<PreparedAudio?>>();
+            int seed = Math.Min(prefetchDepth, segments.Count);
+            for (int s = 0; s < seed; s++)
+            {
+                var seg = segments[s];
+                tasks.Enqueue(Task.Run(() => SynthesizeSegmentAudio(seg, token), token));
+            }
+
+            string? abortReason = null;
             for (int i = 0; i < segments.Count; i++)
             {
                 if (token.IsCancellationRequested) return;
-                var prepared = nextTask.GetAwaiter().GetResult();
-                if (prepared == null) return;
-
-                if (i + 1 < segments.Count)
+                PreparedAudio? prepared = null;
+                try
                 {
-                    var nextSeg = segments[i + 1];
-                    nextTask = Task.Run(() => SynthesizeSegmentAudio(nextSeg, token), token);
+                    var task = tasks.Dequeue();
+                    if (!task.Wait(12000))
+                    {
+                        abortReason = $"synth_timeout i={i} kind={segments[i].Kind}";
+                        break;
+                    }
+                    prepared = task.GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    abortReason = $"dequeue_failed i={i} ex={ex.GetType().Name}";
+                    break;
+                }
+                if (prepared == null)
+                {
+                    abortReason = $"synth_null i={i} kind={segments[i].Kind}";
+                    break;
+                }
+
+                int nextIndex = i + seed;
+                if (nextIndex < segments.Count)
+                {
+                    var seg = segments[nextIndex];
+                    tasks.Enqueue(Task.Run(() => SynthesizeSegmentAudio(seg, token), token));
                 }
 
                 if (token.IsCancellationRequested) return;
-                PlayPreparedAudio(prepared, token);
+                if (!TryExtractWav(prepared.WavStream, out var fmt, out var pcm))
+                {
+                    abortReason = $"extract_failed i={i} kind={segments[i].Kind}";
+                    break;
+                }
+                if (pcm.Length == 0) continue;
+
+                player ??= new WaveOutPlayer(fmt);
+                _bufferedWavePlayer = player;
+                if (!player.IsSameFormat(fmt))
+                {
+                    abortReason = $"format_mismatch i={i}";
+                    break;
+                }
+
+                if (carryTail != null)
+                {
+                    if (carryFmt.IsValid && carryFmt.IsPcm16 && fmt.IsPcm16 && player.IsSameFormat(carryFmt))
+                    {
+                        int m = Math.Min(carryTail.Length, pcm.Length);
+                        m = (m / carryFmt.BlockAlign) * carryFmt.BlockAlign;
+                        if (m > 0)
+                        {
+                            MixPcm16TailWithHead(carryTail, pcm, m, carryFmt);
+                            player.Enqueue(carryTail);
+                            var swBack = Stopwatch.StartNew();
+                            while (!token.IsCancellationRequested && player.InFlight > 4)
+                            {
+                                Thread.Sleep(10);
+                                if (swBack.ElapsedMilliseconds > 3000) break;
+                            }
+
+                            var remain = new byte[pcm.Length - m];
+                            Buffer.BlockCopy(pcm, m, remain, 0, remain.Length);
+                            pcm = remain;
+                        }
+                        else
+                        {
+                            player.Enqueue(carryTail);
+                            var swBack = Stopwatch.StartNew();
+                            while (!token.IsCancellationRequested && player.InFlight > 4)
+                            {
+                                Thread.Sleep(10);
+                                if (swBack.ElapsedMilliseconds > 3000) break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        player.Enqueue(carryTail);
+                        var swBack = Stopwatch.StartNew();
+                        while (!token.IsCancellationRequested && player.InFlight > 4)
+                        {
+                            Thread.Sleep(10);
+                            if (swBack.ElapsedMilliseconds > 3000) break;
+                        }
+                    }
+
+                    carryTail = null;
+                }
+
+                if (pcm.Length == 0) continue;
+
+                int holdBackBytes = 0;
+                if (i + 1 < segments.Count && segments[i].Kind != segments[i + 1].Kind && fmt.IsPcm16)
+                {
+                    double sec = segments[i + 1].Kind == TextKind.English ? _pronunciationEnglishInAdvanceSeconds : _pronunciationChineseInAdvanceSeconds;
+                    long frames = (long)(fmt.SamplesPerSec * sec);
+                    if (frames > 0)
+                    {
+                        long bytes = frames * fmt.BlockAlign;
+                        if (bytes > int.MaxValue) bytes = int.MaxValue;
+                        int b = (int)bytes;
+                        b = (b / fmt.BlockAlign) * fmt.BlockAlign;
+                        if (b > 0) holdBackBytes = b;
+                    }
+                }
+
+                if (holdBackBytes > 0)
+                {
+                    int m = Math.Min(holdBackBytes, pcm.Length);
+                    m = (m / fmt.BlockAlign) * fmt.BlockAlign;
+                    int mainLen = pcm.Length - m;
+
+                    if (mainLen > 0)
+                    {
+                        var main = new byte[mainLen];
+                        Buffer.BlockCopy(pcm, 0, main, 0, mainLen);
+                        player.Enqueue(main);
+                        var swBack = Stopwatch.StartNew();
+                        while (!token.IsCancellationRequested && player.InFlight > 4)
+                        {
+                            Thread.Sleep(10);
+                            if (swBack.ElapsedMilliseconds > 3000) break;
+                        }
+                    }
+
+                    if (m > 0)
+                    {
+                        carryTail = new byte[m];
+                        Buffer.BlockCopy(pcm, mainLen, carryTail, 0, m);
+                        carryFmt = fmt;
+                    }
+                }
+                else
+                {
+                    player.Enqueue(pcm);
+                    var swBack = Stopwatch.StartNew();
+                    while (!token.IsCancellationRequested && player.InFlight > 4)
+                    {
+                        Thread.Sleep(10);
+                        if (swBack.ElapsedMilliseconds > 3000) break;
+                    }
+                }
+            }
+
+            if (!token.IsCancellationRequested && player != null && carryTail != null && carryTail.Length > 0)
+            {
+                Log($"BufferedPlaybackWorker flush_carry bytes={carryTail.Length}");
+                player.Enqueue(carryTail);
+            }
+
+            if (player != null)
+            {
+                var swDrain = Stopwatch.StartNew();
+                while (!token.IsCancellationRequested && player.InFlight > 0)
+                {
+                    Thread.Sleep(10);
+                    if (swDrain.ElapsedMilliseconds > 15000)
+                    {
+                        Log("BufferedPlaybackWorker drain_timeout");
+                        try { player.Stop(); } catch { }
+                        break;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(abortReason))
+            {
+                Log($"BufferedPlaybackWorker abort {abortReason}");
             }
         }
         finally
         {
+            try { player?.Dispose(); } catch { }
+            if (ReferenceEquals(_bufferedWavePlayer, player)) _bufferedWavePlayer = null;
             try
             {
                 BeginInvoke(new Action(() =>
@@ -2397,6 +2618,29 @@ public partial class MainForm : Form
                 }));
             }
             catch { }
+        }
+    }
+
+    private static void MixPcm16TailWithHead(byte[] tail, byte[] head, int mixBytes, WaveFormat fmt)
+    {
+        if (!fmt.IsPcm16) return;
+        int frameSize = fmt.BlockAlign;
+        if (frameSize <= 0) return;
+
+        int tailStart = tail.Length - mixBytes;
+        if (tailStart < 0) tailStart = 0;
+        int len = Math.Min(mixBytes, Math.Min(tail.Length - tailStart, head.Length));
+        len = (len / frameSize) * frameSize;
+        if (len <= 0) return;
+
+        for (int i = 0; i < len; i += 2)
+        {
+            int t = tailStart + i;
+            short a = (short)(tail[t] | (tail[t + 1] << 8));
+            short b = (short)(head[i] | (head[i + 1] << 8));
+            int s = (a + b) / 2;
+            tail[t] = (byte)(s & 0xFF);
+            tail[t + 1] = (byte)((s >> 8) & 0xFF);
         }
     }
 
@@ -2426,12 +2670,18 @@ public partial class MainForm : Form
         {
             var ms = new MemoryStream();
             using var synth = new SpeechSynthesizer();
-            synth.SetOutputToWaveStream(ms);
+            var outFmt = new SpeechAudioFormatInfo(48000, AudioBitsPerSample.Sixteen, AudioChannel.Mono);
+            synth.SetOutputToAudioStream(ms, outFmt);
             synth.Volume = _voice.Volume;
             synth.Rate = ClampRate(rate);
             if (!string.IsNullOrWhiteSpace(voiceName))
             {
-                try { synth.SelectVoice(voiceName); } catch { }
+                try { synth.SelectVoice(voiceName); }
+                catch
+                {
+                    Log($"SynthesizeSegmentAudio SelectVoice failed voice={voiceName}");
+                    return null;
+                }
             }
 
             if (token.IsCancellationRequested) return null;
@@ -2445,36 +2695,13 @@ public partial class MainForm : Form
         }
     }
 
-    private void PlayPreparedAudio(PreparedAudio audio, CancellationToken token)
-    {
-        if (token.IsCancellationRequested) return;
-
-        SoundPlayer? player = null;
-        try
-        {
-            player = new SoundPlayer(audio.WavStream);
-            _bufferedCurrentPlayer = player;
-            player.Load();
-            player.PlaySync();
-        }
-        catch
-        {
-        }
-        finally
-        {
-            try { player?.Stop(); } catch { }
-            try { player?.Dispose(); } catch { }
-            if (ReferenceEquals(_bufferedCurrentPlayer, player)) _bufferedCurrentPlayer = null;
-            try { audio.Dispose(); } catch { }
-        }
-    }
-
     private PromptBuilder? BuildMixedVoicePrompt(string text)
     {
         try
         {
             var segments = SplitByLanguage(text);
             segments = SmoothSegments(segments);
+            segments = NormalizeMixedBoundaryWhitespace(segments);
             if (segments.Count == 0) return null;
 
             var prompt = new PromptBuilder();
@@ -2551,6 +2778,464 @@ public partial class MainForm : Form
         {
             return null;
         }
+    }
+
+    private static bool TryExtractWav(MemoryStream wavStream, out WaveFormat fmt, out byte[] pcm)
+    {
+        fmt = default;
+        pcm = Array.Empty<byte>();
+        try
+        {
+            var data = wavStream.ToArray();
+            if (data.Length == 0) return false;
+
+            if (data.Length < 12 || data[0] != (byte)'R' || data[1] != (byte)'I' || data[2] != (byte)'F' || data[3] != (byte)'F')
+            {
+                const ushort rawFormatTag = 1;
+                const ushort rawChannels = 1;
+                const uint rawSamplesPerSec = 48000;
+                const ushort rawBitsPerSample = 16;
+                ushort rawBlockAlign = (ushort)(rawChannels * (rawBitsPerSample / 8));
+                uint rawAvgBytesPerSec = rawSamplesPerSec * rawBlockAlign;
+                fmt = new WaveFormat(rawFormatTag, rawChannels, rawSamplesPerSec, rawAvgBytesPerSec, rawBlockAlign, rawBitsPerSample);
+                pcm = data;
+                return pcm.Length > 0 && fmt.IsValid;
+            }
+            if (data.Length < 44) return false;
+            int offset = 0;
+            if (data[offset++] != (byte)'R' || data[offset++] != (byte)'I' || data[offset++] != (byte)'F' || data[offset++] != (byte)'F') return false;
+            offset += 4;
+            if (data[offset++] != (byte)'W' || data[offset++] != (byte)'A' || data[offset++] != (byte)'V' || data[offset++] != (byte)'E') return false;
+
+            ushort wFormatTag = 0;
+            ushort nChannels = 0;
+            uint nSamplesPerSec = 0;
+            uint nAvgBytesPerSec = 0;
+            ushort nBlockAlign = 0;
+            ushort wBitsPerSample = 0;
+            int fmtFound = 0;
+            int dataFound = 0;
+
+            while (offset + 8 <= data.Length)
+            {
+                uint id = BitConverter.ToUInt32(data, offset);
+                offset += 4;
+                int size = BitConverter.ToInt32(data, offset);
+                offset += 4;
+                if (size < 0 || offset + size > data.Length) break;
+
+                if (id == 0x20746D66)
+                {
+                    if (size < 16) return false;
+                    wFormatTag = BitConverter.ToUInt16(data, offset + 0);
+                    nChannels = BitConverter.ToUInt16(data, offset + 2);
+                    nSamplesPerSec = BitConverter.ToUInt32(data, offset + 4);
+                    nAvgBytesPerSec = BitConverter.ToUInt32(data, offset + 8);
+                    nBlockAlign = BitConverter.ToUInt16(data, offset + 12);
+                    wBitsPerSample = BitConverter.ToUInt16(data, offset + 14);
+                    fmtFound = 1;
+                }
+                else if (id == 0x61746164)
+                {
+                    pcm = new byte[size];
+                    Buffer.BlockCopy(data, offset, pcm, 0, size);
+                    dataFound = 1;
+                }
+
+                offset += size;
+                if ((size & 1) == 1) offset += 1;
+                if (fmtFound == 1 && dataFound == 1) break;
+            }
+
+            if (fmtFound == 0 || dataFound == 0) return false;
+            fmt = new WaveFormat(wFormatTag, nChannels, nSamplesPerSec, nAvgBytesPerSec, nBlockAlign, wBitsPerSample);
+            return pcm.Length > 0 && fmt.IsValid;
+        }
+        catch
+        {
+            fmt = default;
+            pcm = Array.Empty<byte>();
+            return false;
+        }
+    }
+
+    private static byte[] TrimSilence(byte[] pcm, WaveFormat fmt, int leadingPadMs, int trailingPadMs)
+    {
+        try
+        {
+            if (pcm.Length == 0) return pcm;
+            if (!fmt.IsPcm16) return pcm;
+            int frameSize = fmt.BlockAlign;
+            if (frameSize <= 0) return pcm;
+            int totalFrames = pcm.Length / frameSize;
+            if (totalFrames <= 0) return Array.Empty<byte>();
+
+            int threshold = 80;
+            int first = 0;
+            int last = totalFrames - 1;
+
+            bool FrameHasSignal(int frameIndex)
+            {
+                int baseOff = frameIndex * frameSize;
+                for (int ch = 0; ch < fmt.Channels; ch++)
+                {
+                    int off = baseOff + ch * 2;
+                    short s = (short)(pcm[off] | (pcm[off + 1] << 8));
+                    if (s < 0) s = (short)-s;
+                    if (s > threshold) return true;
+                }
+                return false;
+            }
+
+            while (first < totalFrames && !FrameHasSignal(first)) first++;
+            while (last >= first && !FrameHasSignal(last)) last--;
+            if (last < first) return Array.Empty<byte>();
+
+            int padLead = (int)((long)fmt.SamplesPerSec * Math.Max(0, leadingPadMs) / 1000L);
+            int padTrail = (int)((long)fmt.SamplesPerSec * Math.Max(0, trailingPadMs) / 1000L);
+            int start = Math.Max(0, first - padLead);
+            int end = Math.Min(totalFrames - 1, last + padTrail);
+            int frames = end - start + 1;
+            if (frames <= 0) return Array.Empty<byte>();
+
+            int bytes = frames * frameSize;
+            var outBytes = new byte[bytes];
+            Buffer.BlockCopy(pcm, start * frameSize, outBytes, 0, bytes);
+            return outBytes;
+        }
+        catch
+        {
+            return pcm;
+        }
+    }
+
+    private readonly struct WaveFormat
+    {
+        public WaveFormat(ushort formatTag, ushort channels, uint samplesPerSec, uint avgBytesPerSec, ushort blockAlign, ushort bitsPerSample)
+        {
+            FormatTag = formatTag;
+            Channels = channels;
+            SamplesPerSec = samplesPerSec;
+            AvgBytesPerSec = avgBytesPerSec;
+            BlockAlign = blockAlign;
+            BitsPerSample = bitsPerSample;
+        }
+
+        public ushort FormatTag { get; }
+        public ushort Channels { get; }
+        public uint SamplesPerSec { get; }
+        public uint AvgBytesPerSec { get; }
+        public ushort BlockAlign { get; }
+        public ushort BitsPerSample { get; }
+
+        public bool IsValid => Channels > 0 && SamplesPerSec > 0 && BlockAlign > 0 && BitsPerSample > 0;
+        public bool IsPcm16 => FormatTag == 1 && BitsPerSample == 16 && BlockAlign == Channels * 2;
+    }
+
+    private sealed class WaveOutPlayer : IDisposable
+    {
+        private const int WAVE_MAPPER = -1;
+        private const int CALLBACK_EVENT = 0x00050000;
+        private const uint WHDR_DONE = 0x00000001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WAVEFORMATEX
+        {
+            public ushort wFormatTag;
+            public ushort nChannels;
+            public uint nSamplesPerSec;
+            public uint nAvgBytesPerSec;
+            public ushort nBlockAlign;
+            public ushort wBitsPerSample;
+            public ushort cbSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WAVEHDR
+        {
+            public IntPtr lpData;
+            public uint dwBufferLength;
+            public uint dwBytesRecorded;
+            public IntPtr dwUser;
+            public uint dwFlags;
+            public uint dwLoops;
+            public IntPtr lpNext;
+            public IntPtr reserved;
+        }
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutOpen(out IntPtr hWaveOut, int uDeviceID, ref WAVEFORMATEX lpFormat, IntPtr dwCallback, IntPtr dwInstance, int dwFlags);
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutPrepareHeader(IntPtr hWaveOut, IntPtr lpWaveOutHdr, int uSize);
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutUnprepareHeader(IntPtr hWaveOut, IntPtr lpWaveOutHdr, int uSize);
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutWrite(IntPtr hWaveOut, IntPtr lpWaveOutHdr, int uSize);
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutReset(IntPtr hWaveOut);
+
+        [DllImport("winmm.dll")]
+        private static extern int waveOutClose(IntPtr hWaveOut);
+
+        private sealed class BufferState
+        {
+            public IntPtr HeaderPtr;
+            public IntPtr DataPtr;
+        }
+
+        private readonly object _gate = new();
+        private IntPtr _hwo;
+        private WaveFormat _fmt;
+        private int _disposed;
+        private int _accepting = 1;
+        private readonly AutoResetEvent _doneEvent = new(false);
+        private readonly ManualResetEvent _stopEvent = new(false);
+        private readonly Thread _reapThread;
+        private readonly List<BufferState> _buffers = new();
+
+        public WaveOutPlayer(WaveFormat fmt)
+        {
+            _fmt = fmt;
+            var wf = new WAVEFORMATEX
+            {
+                wFormatTag = fmt.FormatTag,
+                nChannels = fmt.Channels,
+                nSamplesPerSec = fmt.SamplesPerSec,
+                nAvgBytesPerSec = fmt.AvgBytesPerSec,
+                nBlockAlign = fmt.BlockAlign,
+                wBitsPerSample = fmt.BitsPerSample,
+                cbSize = 0
+            };
+            var rc = waveOutOpen(out _hwo, WAVE_MAPPER, ref wf, _doneEvent.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CALLBACK_EVENT);
+            if (rc != 0) _hwo = IntPtr.Zero;
+
+            _reapThread = new Thread(ReapLoop)
+            {
+                IsBackground = true,
+                Name = "WaveOutPlayer.ReapLoop"
+            };
+            _reapThread.Start();
+        }
+
+        public int InFlight => Volatile.Read(ref _inFlight);
+        private int _inFlight;
+
+        public bool IsSameFormat(WaveFormat fmt)
+        {
+            return fmt.FormatTag == _fmt.FormatTag
+                && fmt.Channels == _fmt.Channels
+                && fmt.SamplesPerSec == _fmt.SamplesPerSec
+                && fmt.AvgBytesPerSec == _fmt.AvgBytesPerSec
+                && fmt.BlockAlign == _fmt.BlockAlign
+                && fmt.BitsPerSample == _fmt.BitsPerSample;
+        }
+
+        public void Enqueue(byte[] pcm)
+        {
+            if (pcm.Length == 0) return;
+            if (Volatile.Read(ref _disposed) == 1) return;
+            if (Volatile.Read(ref _accepting) == 0) return;
+
+            lock (_gate)
+            {
+                if (_hwo == IntPtr.Zero) return;
+                if (Volatile.Read(ref _accepting) == 0) return;
+
+                var dataPtr = Marshal.AllocHGlobal(pcm.Length);
+                Marshal.Copy(pcm, 0, dataPtr, pcm.Length);
+
+                var state = new BufferState();
+                state.DataPtr = dataPtr;
+
+                var hdr = new WAVEHDR
+                {
+                    lpData = dataPtr,
+                    dwBufferLength = (uint)pcm.Length,
+                    dwBytesRecorded = 0,
+                    dwUser = IntPtr.Zero,
+                    dwFlags = 0,
+                    dwLoops = 0,
+                    lpNext = IntPtr.Zero,
+                    reserved = IntPtr.Zero
+                };
+
+                int hdrSize = Marshal.SizeOf<WAVEHDR>();
+                var hdrPtr = Marshal.AllocHGlobal(hdrSize);
+                state.HeaderPtr = hdrPtr;
+                Marshal.StructureToPtr(hdr, hdrPtr, false);
+
+                var rcPrep = waveOutPrepareHeader(_hwo, hdrPtr, hdrSize);
+                if (rcPrep != 0)
+                {
+                    try { Marshal.FreeHGlobal(hdrPtr); } catch { }
+                    try { Marshal.FreeHGlobal(dataPtr); } catch { }
+                    return;
+                }
+
+                Interlocked.Increment(ref _inFlight);
+                var rcWrite = waveOutWrite(_hwo, hdrPtr, hdrSize);
+                if (rcWrite != 0)
+                {
+                    Interlocked.Decrement(ref _inFlight);
+                    try { waveOutUnprepareHeader(_hwo, hdrPtr, hdrSize); } catch { }
+                    try { Marshal.FreeHGlobal(hdrPtr); } catch { }
+                    try { Marshal.FreeHGlobal(dataPtr); } catch { }
+                    return;
+                }
+
+                state.HeaderPtr = hdrPtr;
+                _buffers.Add(state);
+            }
+        }
+
+        public void Stop()
+        {
+            Volatile.Write(ref _accepting, 0);
+            IntPtr h;
+            lock (_gate)
+            {
+                h = _hwo;
+                if (h != IntPtr.Zero)
+                {
+                    try { waveOutReset(h); } catch { }
+                }
+            }
+        }
+
+        private void ReapLoop()
+        {
+            try
+            {
+                var waits = new WaitHandle[] { _doneEvent, _stopEvent };
+                while (true)
+                {
+                    int signaled = WaitHandle.WaitAny(waits);
+                    if (signaled == 1) return;
+                    DrainDoneBuffers();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void DrainDoneBuffers()
+        {
+            List<BufferState>? done = null;
+            IntPtr h;
+            lock (_gate)
+            {
+                h = _hwo;
+                if (h == IntPtr.Zero || _buffers.Count == 0) return;
+
+                for (int i = _buffers.Count - 1; i >= 0; i--)
+                {
+                    var st = _buffers[i];
+                    if (st.HeaderPtr == IntPtr.Zero) continue;
+                    WAVEHDR hdr;
+                    try { hdr = Marshal.PtrToStructure<WAVEHDR>(st.HeaderPtr); }
+                    catch { continue; }
+                    if ((hdr.dwFlags & WHDR_DONE) == 0) continue;
+
+                    done ??= new List<BufferState>();
+                    done.Add(st);
+                    _buffers.RemoveAt(i);
+                }
+            }
+
+            if (done == null) return;
+            int hdrSize = Marshal.SizeOf<WAVEHDR>();
+            foreach (var st in done)
+            {
+                try { if (h != IntPtr.Zero) waveOutUnprepareHeader(h, st.HeaderPtr, hdrSize); } catch { }
+                try { if (st.HeaderPtr != IntPtr.Zero) Marshal.FreeHGlobal(st.HeaderPtr); } catch { }
+                try { if (st.DataPtr != IntPtr.Zero) Marshal.FreeHGlobal(st.DataPtr); } catch { }
+                int v = Interlocked.Decrement(ref _inFlight);
+                if (v < 0) Interlocked.Exchange(ref _inFlight, 0);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+
+            Stop();
+            try { _stopEvent.Set(); } catch { }
+            try { _doneEvent.Set(); } catch { }
+            try { if (_reapThread.IsAlive) _reapThread.Join(300); } catch { }
+
+            try { DrainDoneBuffers(); } catch { }
+
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 800 && Volatile.Read(ref _inFlight) > 0)
+            {
+                Thread.Sleep(10);
+            }
+
+            IntPtr h;
+            lock (_gate)
+            {
+                h = _hwo;
+                _hwo = IntPtr.Zero;
+                _buffers.Clear();
+            }
+
+            if (h != IntPtr.Zero)
+            {
+                try { waveOutClose(h); } catch { }
+            }
+
+            try { _doneEvent.Dispose(); } catch { }
+            try { _stopEvent.Dispose(); } catch { }
+        }
+    }
+
+    private static List<TextSegment> NormalizeMixedBoundaryWhitespace(List<TextSegment> segments)
+    {
+        if (segments.Count <= 1) return segments;
+
+        static bool IsWs(char ch)
+        {
+            return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\u3000';
+        }
+
+        static string TrimEndWs(string s)
+        {
+            int end = s.Length - 1;
+            while (end >= 0 && IsWs(s[end])) end--;
+            if (end == s.Length - 1) return s;
+            return end < 0 ? "" : s.Substring(0, end + 1);
+        }
+
+        static string TrimStartWs(string s)
+        {
+            int start = 0;
+            while (start < s.Length && IsWs(s[start])) start++;
+            if (start == 0) return s;
+            return start >= s.Length ? "" : s.Substring(start);
+        }
+
+        var list = segments;
+        for (int i = 0; i + 1 < list.Count; i++)
+        {
+            var a = list[i];
+            var b = list[i + 1];
+            if (a.Kind == b.Kind) continue;
+
+            var at = TrimEndWs(a.Text);
+            var bt = TrimStartWs(b.Text);
+            if (!ReferenceEquals(at, a.Text) || !ReferenceEquals(bt, b.Text))
+            {
+                if (ReferenceEquals(list, segments)) list = new List<TextSegment>(segments);
+                list[i] = new TextSegment(a.Kind, at);
+                list[i + 1] = new TextSegment(b.Kind, bt);
+            }
+        }
+        return list;
     }
 
     private void AppendSegmentText(PromptBuilder prompt, TextSegment segment)
@@ -3157,6 +3842,12 @@ public class AppConfig
     public bool? PrebufferMixedAudio { get; set; }
     public int? PrebufferMinTextLength { get; set; }
     public int? PrebufferMaxSegmentChars { get; set; }
+    [JsonPropertyName("Pronunciation in advance")]
+    public double? PronunciationInAdvance { get; set; }
+    [JsonPropertyName("Pronunciation English in advance")]
+    public double? PronunciationEnglishInAdvance { get; set; }
+    [JsonPropertyName("Pronunciation Chinese in advance")]
+    public double? PronunciationChineseInAdvance { get; set; }
     public int Volume { get; set; } = 100;
     public object EscapeRules { get; set; } = "";
     public bool TopMost { get; set; } = false;
