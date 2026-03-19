@@ -479,12 +479,10 @@ public partial class MainForm : Form
 
     private async void HandleHotkey()
     {
+        var sw = Stopwatch.StartNew();
         Log("HandleHotkey start");
-        // 1. 立即中断之前的朗读 (提高响应速度)
-        bool needHardReset = _isSpeaking
-            || (_voice != null && _voice.State == SynthesizerState.Speaking)
-            || _bufferedCurrentPlayer != null;
-        StopSpeakingInternal(updateStatus: false, hardReset: needHardReset);
+        StopSpeakingInternal(updateStatus: false, hardReset: false);
+        Log($"HandleHotkey stop_ms={sw.ElapsedMilliseconds}");
 
         try
         {
@@ -526,7 +524,7 @@ public partial class MainForm : Form
                 UpdateStatusLabel();
                 return;
             }
-            Log($"HandleHotkey clipboard length={text.Length}");
+            Log($"HandleHotkey clipboard length={text.Length} clipboard_ms={sw.ElapsedMilliseconds}");
             
             if (_onlyReadFirstLine)
             {
@@ -549,7 +547,7 @@ public partial class MainForm : Form
 
             string processedText = await Task.Run(() => ApplyEscapeRules(text, token), token);
             if (token.IsCancellationRequested) return;
-            Log($"HandleHotkey processed length={processedText.Length}");
+            Log($"HandleHotkey processed length={processedText.Length} process_ms={sw.ElapsedMilliseconds}");
 
             AddReadingRecord(processedText);
 
@@ -564,6 +562,7 @@ public partial class MainForm : Form
             }
 
             SpeakText(processedText);
+            Log($"HandleHotkey speak_called_ms={sw.ElapsedMilliseconds}");
         }
         catch (Exception ex)
         {
@@ -659,7 +658,10 @@ public partial class MainForm : Form
             ApplyBaseConfigToSynth(next);
 
             _voice = next;
-            try { _installedVoices = next.GetInstalledVoices().Where(v => v.Enabled).ToList(); } catch { }
+            if (_installedVoices.Count == 0)
+            {
+                try { _installedVoices = next.GetInstalledVoices().Where(v => v.Enabled).ToList(); } catch { }
+            }
 
             DisposeOldSynthAsync(old);
             Log($"RecreateSpeechSynthesizer done state={_voice.State}");
