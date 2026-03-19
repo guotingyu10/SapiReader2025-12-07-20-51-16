@@ -9,13 +9,36 @@
 为这个项目添加防止扬声器休眠的功能(持续播放无声声音)
 
 
+
+分析在朗读时,复制了大量文本后(带有特殊符号)是否可能导致软件卡死,无法暂停;
+
+能否在朗读大批量文本时,将文本分段处理,汉语的一段,英语的一段,将这些音频暂存在内存中,朗读完这个文本的音频,释放这段文本的音频,进一步降低中英文切换时间;
+
+
+
+在日志功能添加;分析为什么在朗读长文本时,暂停快捷键F3无法使用;
+
+
+
+
+按下F1时且复制新文本开始朗读时;
+使用F3的
+- 硬复位时先立刻静音旧引擎： SetOutputToNull() + Volume=0 + SpeakAsyncCancelAll()
+- 不在 UI 线程 Dispose 旧引擎 ：改为后台 STA 线程异步 Dispose，避免把 UI 卡死
+- 增加异常日志：如果复位内部出错，会写入 RecreateSpeechSynthesizer error ... ，方便定位
+然后开始朗读新内容
+
+
+
+
+
 dotnet run
 
 
 dotnet publish -c Release -o ./publish
 dotnet publish
  -c Release -o ./publish
-
+dotnet build .\SapiReader.csproj -c Release
 
 
 

@@ -55,6 +55,16 @@ public partial class MainForm : Form
     private bool _preventSpeakerSleep = false;
     private SoundPlayer? _speakerKeepAlivePlayer;
     private MemoryStream? _speakerKeepAliveStream;
+    private CancellationTokenSource? _operationCts;
+    private bool _prebufferMixedAudio = false;
+    private int _prebufferMinTextLength = 400;
+    private int _prebufferMaxSegmentChars = 200;
+    private CancellationTokenSource? _bufferedPlaybackCts;
+    private SoundPlayer? _bufferedCurrentPlayer;
+    private int _forceResetSynthAfterStopMs = 800;
+    private AppConfig? _lastAppliedConfig;
+    private CancellationTokenSource? _stopResetCts;
+    private int _disposeOldSynthTimeoutMs = 50;
 
     // 朗读记录（最多1000条，超出覆盖）
     private int _maxHistory = 1000;
@@ -91,10 +101,13 @@ public partial class MainForm : Form
     private FileSystemWatcher? _configWatcher;
     private bool _restartScheduled = false;
     private bool _selfSaving = false;
+    private readonly object _logLock = new();
+    private string _logPath = "debug.log";
+    private long _logMaxBytes = 5L * 1024 * 1024;
+    private bool _logEnabled = true;
 
     public MainForm()
     {
-        Log("MainForm Constructor Started");
         // 计算配置文件路径
         // 优先查找当前工作目录（方便开发调试和便携使用）
         string currentDirConfig = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
@@ -107,6 +120,17 @@ public partial class MainForm : Form
             // 否则使用应用程序所在目录
             _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
         }
+
+        try
+        {
+            var logDir = Path.GetDirectoryName(_configPath);
+            if (string.IsNullOrWhiteSpace(logDir)) logDir = AppContext.BaseDirectory;
+            _logPath = Path.Combine(logDir, "sapi-reader.log");
+        }
+        catch { }
+
+        TryLoadLogEnabledFromConfig();
+        Log($"AppStart configPath={_configPath}");
         
         InitializeComponent();
         Log("InitializeComponent Done");
@@ -121,7 +145,51 @@ public partial class MainForm : Form
 
     private void Log(string message)
     {
-        try { File.AppendAllText("debug.log", $"[{DateTime.Now}] {message}\n"); } catch {}
+        if (!_logEnabled) return;
+        try
+        {
+            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [T{Environment.CurrentManagedThreadId}] {message}\n";
+            lock (_logLock)
+            {
+                try
+                {
+                    var fi = new FileInfo(_logPath);
+                    if (fi.Exists && fi.Length >= _logMaxBytes)
+                    {
+                        string rotated = _logPath + ".1";
+                        try { if (File.Exists(rotated)) File.Delete(rotated); } catch { }
+                        try { File.Move(_logPath, rotated); } catch { }
+                    }
+                }
+                catch { }
+
+                try { File.AppendAllText(_logPath, line); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private void TryLoadLogEnabledFromConfig()
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_configPath)) return;
+            if (!File.Exists(_configPath)) return;
+            var json = File.ReadAllText(_configPath);
+            var options = new JsonDocumentOptions
+            {
+                AllowTrailingCommas = true,
+                CommentHandling = JsonCommentHandling.Skip
+            };
+            using var doc = JsonDocument.Parse(json, options);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
+            if (doc.RootElement.TryGetProperty("sapi-reader.log", out var prop)
+                && (prop.ValueKind == JsonValueKind.True || prop.ValueKind == JsonValueKind.False))
+            {
+                _logEnabled = prop.GetBoolean();
+            }
+        }
+        catch { }
     }
 
     protected override void OnLoad(EventArgs e)
@@ -254,6 +322,7 @@ public partial class MainForm : Form
         _voice = new SpeechSynthesizer();
         // 获取发音人列表供查询
         _installedVoices = _voice.GetInstalledVoices().Where(v => v.Enabled).ToList();
+        AttachVoiceEvents(_voice);
     }
 
     private void ListVoices_Click(object? sender, EventArgs e)
@@ -345,22 +414,25 @@ public partial class MainForm : Form
 
         // 注册朗读热键
         bool ok = RegisterHotKey(this.Handle, HOTKEY_ID, 0, _hotkeyKey);
+        Log($"RegisterHotKey read ok={ok} vk={VkToDisplay(_hotkeyKey)}");
         if (!ok)
         {
-            _statusLabel.Text = $"朗读热键(F{_hotkeyKey - 0x6F})注册失败！可能被占用";
+            _statusLabel.Text = $"朗读热键({VkToDisplay(_hotkeyKey)})注册失败！可能被占用";
             _statusLabel.ForeColor = Color.Red;
         }
         
         // 注册停止热键
         bool stopOk = RegisterHotKey(this.Handle, STOP_HOTKEY_ID, 0, _stopHotkeyKey);
+        Log($"RegisterHotKey stop ok={stopOk} vk={VkToDisplay(_stopHotkeyKey)}");
         if (!stopOk)
         {
-            _statusLabel.Text = $"停止热键(F{_stopHotkeyKey - 0x6F})注册失败！可能被占用";
+            _statusLabel.Text = $"停止热键({VkToDisplay(_stopHotkeyKey)})注册失败！可能被占用";
             _statusLabel.ForeColor = Color.Red;
         }
         
         // 注册自动朗读热键
         bool autoReadOk = RegisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID, _autoReadModifiers, _autoReadHotkeyKey);
+        Log($"RegisterHotKey autoRead ok={autoReadOk} mods={_autoReadModifiers} vk={VkToDisplay(_autoReadHotkeyKey)}");
         
         if (ok && stopOk)
         {
@@ -370,8 +442,8 @@ public partial class MainForm : Form
 
     private void UpdateStatusLabel()
     {
-        string keyStr = $"F{_hotkeyKey - 0x6F}";
-        string stopKeyStr = $"F{_stopHotkeyKey - 0x6F}";
+        string keyStr = VkToDisplay(_hotkeyKey);
+        string stopKeyStr = VkToDisplay(_stopHotkeyKey);
         _statusLabel.Text = $"配置已应用 - 按 {keyStr} 朗读，按 {stopKeyStr} 停止";
         _statusLabel.ForeColor = Color.Green;
     }
@@ -380,15 +452,17 @@ public partial class MainForm : Form
     {
         if (m.Msg == WM_HOTKEY)
         {
-            if (m.WParam.ToInt32() == HOTKEY_ID)
+            int id = m.WParam.ToInt32();
+            Log($"WM_HOTKEY id={id} isSpeaking={_isSpeaking} state={_voice?.State} isAutoReading={_isAutoReading}");
+            if (id == HOTKEY_ID)
             {
                 HandleHotkey();
             }
-            else if (m.WParam.ToInt32() == STOP_HOTKEY_ID)
+            else if (id == STOP_HOTKEY_ID)
             {
                 StopSpeaking();
             }
-            else if (m.WParam.ToInt32() == AUTO_READ_HOTKEY_ID)
+            else if (id == AUTO_READ_HOTKEY_ID)
             {
                 if (_isAutoReading)
                 {
@@ -405,13 +479,12 @@ public partial class MainForm : Form
 
     private async void HandleHotkey()
     {
+        Log("HandleHotkey start");
         // 1. 立即中断之前的朗读 (提高响应速度)
-        if (_isSpeaking || _voice.State == SynthesizerState.Speaking)
-        {
-            _voice.SpeakAsyncCancelAll();
-            _isSpeaking = false;
-            // 不在这里等待，利用获取剪贴板的时间作为缓冲
-        }
+        bool needHardReset = _isSpeaking
+            || (_voice != null && _voice.State == SynthesizerState.Speaking)
+            || _bufferedCurrentPlayer != null;
+        StopSpeakingInternal(updateStatus: false, hardReset: needHardReset);
 
         try
         {
@@ -448,10 +521,12 @@ public partial class MainForm : Form
             {
                 _statusLabel.Text = "剪贴板为空";
                 _statusLabel.ForeColor = Color.Orange;
+                Log("HandleHotkey clipboard empty");
                 await Task.Delay(2000);
                 UpdateStatusLabel();
                 return;
             }
+            Log($"HandleHotkey clipboard length={text.Length}");
             
             if (_onlyReadFirstLine)
             {
@@ -464,7 +539,17 @@ public partial class MainForm : Form
                 text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
             }
 
-            string processedText = ApplyEscapeRules(text);
+            CancelCurrentOperation();
+            var cts = new CancellationTokenSource();
+            _operationCts = cts;
+            var token = cts.Token;
+
+            _statusLabel.Text = "正在处理文本...";
+            _statusLabel.ForeColor = Color.Blue;
+
+            string processedText = await Task.Run(() => ApplyEscapeRules(text, token), token);
+            if (token.IsCancellationRequested) return;
+            Log($"HandleHotkey processed length={processedText.Length}");
 
             AddReadingRecord(processedText);
 
@@ -478,34 +563,12 @@ public partial class MainForm : Form
                 catch {}
             }
 
-            // 关键修复: 确保之前的朗读已完全停止 (解决长文本朗读时无法切换新内容的问题)
-            int safetyWait = 0;
-            while (_voice.State == SynthesizerState.Speaking && safetyWait < 50)
-            {
-                await Task.Delay(10);
-                safetyWait++;
-            }
-
-            _isSpeaking = true;
-            _statusLabel.Text = "正在朗读...";
-            _statusLabel.ForeColor = Color.Blue;
-
             SpeakText(processedText);
-            
-            while (_isSpeaking && _voice.State == SynthesizerState.Speaking)
-            {
-                await Task.Delay(50);
-            }
-
-            if (_isSpeaking)
-            {
-                _isSpeaking = false;
-                UpdateStatusLabel();
-            }
         }
         catch (Exception ex)
         {
             _isSpeaking = false;
+            Log($"HandleHotkey error {ex.GetType().Name}: {ex.Message}");
             if (!ex.Message.Contains("canceled") && !ex.Message.Contains("cancelled"))
             {
                 _statusLabel.Text = $"错误: {ex.Message}";
@@ -520,14 +583,186 @@ public partial class MainForm : Form
 
     private void StopSpeaking()
     {
+        StopSpeakingInternal(updateStatus: true, hardReset: true);
+    }
+
+    private void StopSpeakingInternal(bool updateStatus, bool hardReset = false)
+    {
         _isAutoReading = false;
-        _voice.SpeakAsyncCancelAll();
-        _isSpeaking = false;
-        while (_voice.State == SynthesizerState.Speaking)
+        Log($"StopSpeakingInternal updateStatus={updateStatus} hardReset={hardReset} isSpeaking={_isSpeaking} state={_voice?.State}");
+        CancelCurrentOperation();
+        StopBufferedPlayback();
+        CancelPendingStopReset();
+        if (hardReset)
         {
-            System.Threading.Thread.Sleep(10);
+            Log("StopSpeakingInternal action=hard_reset_synth");
+            RecreateSpeechSynthesizer();
+            _isSpeaking = false;
+            if (updateStatus) UpdateStatusLabel();
+            return;
         }
-        UpdateStatusLabel();
+
+        try { _voice?.SpeakAsyncCancelAll(); } catch { }
+        ScheduleForceResetSynthIfStuck();
+        _isSpeaking = false;
+        if (updateStatus) UpdateStatusLabel();
+    }
+
+    private void ScheduleForceResetSynthIfStuck()
+    {
+        try
+        {
+            int delay = _forceResetSynthAfterStopMs;
+            if (delay <= 0) delay = 800;
+            try { _stopResetCts?.Cancel(); } catch { }
+            try { _stopResetCts?.Dispose(); } catch { }
+            _stopResetCts = new CancellationTokenSource();
+            var token = _stopResetCts.Token;
+            Task.Run(async () =>
+            {
+                await Task.Delay(delay);
+                if (token.IsCancellationRequested) return;
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            if (token.IsCancellationRequested) return;
+                            if (_voice != null && _voice.State == SynthesizerState.Speaking)
+                            {
+                                Log($"ForceResetSynth reason=stuck_after_stop state={_voice.State}");
+                                RecreateSpeechSynthesizer();
+                            }
+                        }
+                        catch { }
+                    }));
+                }
+                catch { }
+            }, token);
+        }
+        catch { }
+    }
+
+    private void RecreateSpeechSynthesizer()
+    {
+        try
+        {
+            var old = _voice;
+            try { old?.SetOutputToNull(); } catch { }
+            try { if (old != null) old.Volume = 0; } catch { }
+            try { old?.SpeakAsyncCancelAll(); } catch { }
+
+            var next = new SpeechSynthesizer();
+            try { next.SetOutputToDefaultAudioDevice(); } catch { }
+            AttachVoiceEvents(next);
+            ApplyBaseConfigToSynth(next);
+
+            _voice = next;
+            try { _installedVoices = next.GetInstalledVoices().Where(v => v.Enabled).ToList(); } catch { }
+
+            DisposeOldSynthAsync(old);
+            Log($"RecreateSpeechSynthesizer done state={_voice.State}");
+        }
+        catch (Exception ex)
+        {
+            Log($"RecreateSpeechSynthesizer error {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void CancelCurrentOperation()
+    {
+        try { _operationCts?.Cancel(); } catch { }
+        try { _operationCts?.Dispose(); } catch { }
+        _operationCts = null;
+    }
+
+    private void CancelPendingStopReset()
+    {
+        try { _stopResetCts?.Cancel(); } catch { }
+        try { _stopResetCts?.Dispose(); } catch { }
+        _stopResetCts = null;
+    }
+
+    private void AttachVoiceEvents(SpeechSynthesizer synth)
+    {
+        synth.SpeakStarted += (_, __) =>
+        {
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _isSpeaking = true;
+                    _statusLabel.Text = "正在朗读...";
+                    _statusLabel.ForeColor = Color.Blue;
+                }));
+            }
+            catch { }
+        };
+        synth.SpeakCompleted += (_, __) =>
+        {
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _isSpeaking = false;
+                    if (!_isAutoReading) UpdateStatusLabel();
+                }));
+            }
+            catch { }
+        };
+    }
+
+    private void ApplyBaseConfigToSynth(SpeechSynthesizer synth)
+    {
+        if (_lastAppliedConfig == null) return;
+        try { synth.Volume = _lastAppliedConfig.Volume; } catch { }
+        try { synth.Rate = ClampRate(_lastAppliedConfig.Rate); } catch { }
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(_lastAppliedConfig.VoiceName))
+            {
+                try { synth.SelectVoice(_lastAppliedConfig.VoiceName); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private void DisposeOldSynthAsync(SpeechSynthesizer? old)
+    {
+        if (old == null) return;
+
+        try
+        {
+            var thread = new Thread(() =>
+            {
+                try { old.Dispose(); }
+                catch (Exception ex) { Log($"DisposeOldSynth error {ex.GetType().Name}: {ex.Message}"); }
+            })
+            {
+                IsBackground = true
+            };
+            try { thread.SetApartmentState(ApartmentState.STA); } catch { }
+            thread.Start();
+
+            int timeout = _disposeOldSynthTimeoutMs;
+            if (timeout > 0)
+            {
+                try { thread.Join(timeout); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private void StopBufferedPlayback()
+    {
+        try { _bufferedPlaybackCts?.Cancel(); } catch { }
+        try { _bufferedPlaybackCts?.Dispose(); } catch { }
+        _bufferedPlaybackCts = null;
+
+        try { _bufferedCurrentPlayer?.Stop(); } catch { }
+        try { _bufferedCurrentPlayer?.Dispose(); } catch { }
+        _bufferedCurrentPlayer = null;
     }
 
     private async void StartAutoRead()
@@ -647,14 +882,15 @@ public partial class MainForm : Form
                 text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
             }
 
-            string processedText = ApplyEscapeRules(text);
+            CancelCurrentOperation();
+            var cts = new CancellationTokenSource();
+            _operationCts = cts;
+            var token = cts.Token;
+            string processedText = await Task.Run(() => ApplyEscapeRules(text, token), token);
+            if (token.IsCancellationRequested) return false;
 
             AddReadingRecord(processedText);
             
-            _isSpeaking = true;
-            _statusLabel.Text = "正在朗读...";
-            _statusLabel.ForeColor = Color.Blue;
-
             SpeakText(processedText);
             
             return true;
@@ -679,6 +915,7 @@ public partial class MainForm : Form
         UnregisterHotKey(this.Handle, STOP_HOTKEY_ID);
         UnregisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID);
         _trayIcon.Visible = false;
+        CancelCurrentOperation();
         StopSpeakerKeepAlive();
         base.OnFormClosed(e);
     }
@@ -776,6 +1013,34 @@ public partial class MainForm : Form
         string result = text;
         foreach (var rule in _escapeRulesOrdered)
         {
+            result = result.Replace(rule.Key, rule.Value);
+        }
+        return result;
+    }
+
+    private string ApplyEscapeRules(string text, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return "";
+
+        KeyValuePair<string, string>[] rulesSnapshot;
+        if (_escapeRulesOrdered.Count == 0 && _escapeRules.Count > 0)
+        {
+            rulesSnapshot = _escapeRules
+                .OrderByDescending(kv => kv.Key.Length)
+                .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                .ToArray();
+        }
+        else
+        {
+            rulesSnapshot = _escapeRulesOrdered.ToArray();
+        }
+
+        if (rulesSnapshot.Length == 0) return text;
+
+        string result = text;
+        foreach (var rule in rulesSnapshot)
+        {
+            if (token.IsCancellationRequested) return "";
             result = result.Replace(rule.Key, rule.Value);
         }
         return result;
@@ -1006,16 +1271,10 @@ public partial class MainForm : Form
     
     private void ApplyConfig(AppConfig config)
     {
+        _lastAppliedConfig = config;
         // 1. 热键设置
-        if (config.HotkeyIndex >= 0 && config.HotkeyIndex < 12)
-        {
-            _hotkeyKey = (uint)(0x70 + config.HotkeyIndex);
-        }
-        
-        if (config.StopHotkeyIndex >= 0 && config.StopHotkeyIndex < 12)
-        {
-            _stopHotkeyKey = (uint)(0x70 + config.StopHotkeyIndex);
-        }
+        if (TryParseNoModifierHotkey(config.HotkeyIndex, out uint readVk)) _hotkeyKey = readVk;
+        if (TryParseNoModifierHotkey(config.StopHotkeyIndex, out uint stopVk)) _stopHotkeyKey = stopVk;
 
         // AutoReadHotkeyIndex logic
         string? autoReadStr = null;
@@ -1129,10 +1388,21 @@ public partial class MainForm : Form
         _preventSpeakerSleep = config.PreventSpeakerFromGoingIntoSleepMode ?? false;
         if (_preventSpeakerSleep) StartSpeakerKeepAlive();
         else StopSpeakerKeepAlive();
+
+        _prebufferMixedAudio = config.PrebufferMixedAudio ?? false;
+        _prebufferMinTextLength = config.PrebufferMinTextLength is int minLen ? Math.Max(1, minLen) : 400;
+        _prebufferMaxSegmentChars = config.PrebufferMaxSegmentChars is int maxChars ? Math.Max(50, maxChars) : 200;
+
+        _logEnabled = config.SapiReaderLog ?? true;
+
+        Log($"ApplyConfig readKey={VkToDisplay(_hotkeyKey)} stopKey={VkToDisplay(_stopHotkeyKey)} autoRead={_customAutoReadHotKey}");
+        Log($"ApplyConfig zhVoice={_chineseVoiceName} enVoice={_englishVoiceName} zhRate={_chineseVoiceRate} enRate={_englishVoiceRate}");
+        Log($"ApplyConfig prebufferMixed={_prebufferMixedAudio} minLen={_prebufferMinTextLength} maxSeg={_prebufferMaxSegmentChars} keepAlive={_preventSpeakerSleep}");
     }
 
     private void SpeakText(string text)
     {
+        CancelPendingStopReset();
         if (!_autoSwitchVoice)
         {
             _voice.SpeakAsync(text);
@@ -1147,6 +1417,11 @@ public partial class MainForm : Form
 
         bool hasChinese = ContainsChinese(text);
         bool hasEnglish = ContainsLatinLetter(text);
+        if (_prebufferMixedAudio && hasChinese && hasEnglish && text.Length >= _prebufferMinTextLength)
+        {
+            StartBufferedMixedPlayback(text);
+            return;
+        }
         if (hasChinese && !hasEnglish)
         {
             SelectVoiceSafe(_chineseVoiceName);
@@ -1175,6 +1450,138 @@ public partial class MainForm : Form
         }
 
         _voice.SpeakAsync(prompt);
+    }
+
+    private void StartBufferedMixedPlayback(string text)
+    {
+        CancelPendingStopReset();
+        StopBufferedPlayback();
+        try { _voice.SpeakAsyncCancelAll(); } catch { }
+
+        var cts = new CancellationTokenSource();
+        _bufferedPlaybackCts = cts;
+        var token = cts.Token;
+
+        try
+        {
+            BeginInvoke(new Action(() =>
+            {
+                _isSpeaking = true;
+                _statusLabel.Text = "正在缓冲音频...";
+                _statusLabel.ForeColor = Color.Blue;
+            }));
+        }
+        catch { }
+
+        Task.Run(() => BufferedPlaybackWorker(text, token), token);
+    }
+
+    private void BufferedPlaybackWorker(string text, CancellationToken token)
+    {
+        try
+        {
+            var segments = SmoothSegments(SplitByLanguage(text));
+            segments = SplitLongSegments(segments, _prebufferMaxSegmentChars);
+            if (segments.Count == 0) return;
+
+            Task<PreparedAudio?> nextTask = Task.Run(() => SynthesizeSegmentAudio(segments[0], token), token);
+            for (int i = 0; i < segments.Count; i++)
+            {
+                if (token.IsCancellationRequested) return;
+                var prepared = nextTask.GetAwaiter().GetResult();
+                if (prepared == null) return;
+
+                if (i + 1 < segments.Count)
+                {
+                    var nextSeg = segments[i + 1];
+                    nextTask = Task.Run(() => SynthesizeSegmentAudio(nextSeg, token), token);
+                }
+
+                if (token.IsCancellationRequested) return;
+                PlayPreparedAudio(prepared, token);
+            }
+        }
+        finally
+        {
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _isSpeaking = false;
+                    if (!_isAutoReading) UpdateStatusLabel();
+                }));
+            }
+            catch { }
+        }
+    }
+
+    private sealed class PreparedAudio : IDisposable
+    {
+        public PreparedAudio(MemoryStream wavStream)
+        {
+            WavStream = wavStream;
+        }
+
+        public MemoryStream WavStream { get; }
+
+        public void Dispose()
+        {
+            try { WavStream.Dispose(); } catch { }
+        }
+    }
+
+    private PreparedAudio? SynthesizeSegmentAudio(TextSegment segment, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return null;
+
+        var voiceName = segment.Kind == TextKind.Chinese ? _chineseVoiceName : _englishVoiceName;
+        var rate = segment.Kind == TextKind.Chinese ? _chineseVoiceRate : _englishVoiceRate;
+
+        try
+        {
+            var ms = new MemoryStream();
+            using var synth = new SpeechSynthesizer();
+            synth.SetOutputToWaveStream(ms);
+            synth.Volume = _voice.Volume;
+            synth.Rate = ClampRate(rate);
+            if (!string.IsNullOrWhiteSpace(voiceName))
+            {
+                try { synth.SelectVoice(voiceName); } catch { }
+            }
+
+            if (token.IsCancellationRequested) return null;
+            synth.Speak(segment.Text);
+            ms.Position = 0;
+            return new PreparedAudio(ms);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void PlayPreparedAudio(PreparedAudio audio, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+
+        SoundPlayer? player = null;
+        try
+        {
+            player = new SoundPlayer(audio.WavStream);
+            _bufferedCurrentPlayer = player;
+            player.Load();
+            player.PlaySync();
+        }
+        catch
+        {
+        }
+        finally
+        {
+            try { player?.Stop(); } catch { }
+            try { player?.Dispose(); } catch { }
+            if (ReferenceEquals(_bufferedCurrentPlayer, player)) _bufferedCurrentPlayer = null;
+            try { audio.Dispose(); } catch { }
+        }
     }
 
     private PromptBuilder? BuildMixedVoicePrompt(string text)
@@ -1499,6 +1906,97 @@ public partial class MainForm : Form
         return rate;
     }
 
+    private static string VkToDisplay(uint vk)
+    {
+        if (vk >= 0x70 && vk <= 0x87)
+        {
+            return $"F{vk - 0x70 + 1}";
+        }
+        if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A))
+        {
+            return ((char)vk).ToString();
+        }
+        return $"VK_{vk}";
+    }
+
+    private bool TryParseNoModifierHotkey(object? value, out uint vk)
+    {
+        vk = 0;
+        if (value == null) return false;
+
+        try
+        {
+            if (value is JsonElement element)
+            {
+                if (element.ValueKind == JsonValueKind.String)
+                {
+                    var s = element.GetString();
+                    return TryParseNoModifierHotkeyString(s, out vk);
+                }
+                if (element.ValueKind == JsonValueKind.Number)
+                {
+                    int idx = element.GetInt32();
+                    return TryParseLegacyFunctionKeyIndex(idx, out vk);
+                }
+                return false;
+            }
+
+            if (value is string str)
+            {
+                return TryParseNoModifierHotkeyString(str, out vk);
+            }
+
+            if (value is int i)
+            {
+                return TryParseLegacyFunctionKeyIndex(i, out vk);
+            }
+
+            int converted = Convert.ToInt32(value);
+            return TryParseLegacyFunctionKeyIndex(converted, out vk);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseLegacyFunctionKeyIndex(int idx, out uint vk)
+    {
+        vk = 0;
+        if (idx < 0 || idx >= 12) return false;
+        vk = (uint)(0x70 + idx);
+        return true;
+    }
+
+    private static bool TryParseNoModifierHotkeyString(string? s, out uint vk)
+    {
+        vk = 0;
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        var t = s.Trim();
+
+        if (t.StartsWith("f", StringComparison.OrdinalIgnoreCase) && int.TryParse(t.Substring(1), out int fNum))
+        {
+            if (fNum >= 1 && fNum <= 24)
+            {
+                vk = (uint)(0x70 + fNum - 1);
+                return true;
+            }
+            return false;
+        }
+
+        if (t.Length == 1)
+        {
+            char ch = char.ToUpperInvariant(t[0]);
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
+            {
+                vk = ch;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static PromptRate MapPromptRate(int rate)
     {
         if (rate <= -6) return PromptRate.ExtraSlow;
@@ -1574,6 +2072,31 @@ public partial class MainForm : Form
         return result;
     }
 
+    private List<TextSegment> SplitLongSegments(List<TextSegment> segments, int maxChars)
+    {
+        if (segments.Count == 0) return segments;
+        if (maxChars <= 0) return segments;
+
+        var result = new List<TextSegment>();
+        foreach (var seg in segments)
+        {
+            if (seg.Text.Length <= maxChars)
+            {
+                result.Add(seg);
+                continue;
+            }
+
+            int start = 0;
+            while (start < seg.Text.Length)
+            {
+                int len = Math.Min(maxChars, seg.Text.Length - start);
+                result.Add(new TextSegment(seg.Kind, seg.Text.Substring(start, len)));
+                start += len;
+            }
+        }
+        return result;
+    }
+
     private static int CountLatinLetters(string text)
     {
         int count = 0;
@@ -1598,9 +2121,12 @@ public partial class MainForm : Form
 // 配置类
 public class AppConfig
 {
-    public int HotkeyIndex { get; set; }
-    public int StopHotkeyIndex { get; set; } = 1; // 默认 F2
+    public object HotkeyIndex { get; set; } = 0; // 支持 string (例如 "F1") 或 int (0-11)
+    public object StopHotkeyIndex { get; set; } = 1; // 支持 string (例如 "F3") 或 int (0-11)
     public object AutoReadHotkeyIndex { get; set; } = 0; // 支持 string (自定义) 或 int (F1-F12 索引)
+    [JsonPropertyName("sapi-reader.log")]
+    public bool? SapiReaderLog { get; set; }
+    public string Version { get; set; } = "";
     public string VoiceName { get; set; } = "";
     public string ChineseVoiceName { get; set; } = "";
     public string EnglishVoiceName { get; set; } = "";
@@ -1613,6 +2139,9 @@ public class AppConfig
     public bool? WarmUpVoices { get; set; }
     [JsonPropertyName("Prevent the speaker from going into sleep mode")]
     public bool? PreventSpeakerFromGoingIntoSleepMode { get; set; }
+    public bool? PrebufferMixedAudio { get; set; }
+    public int? PrebufferMinTextLength { get; set; }
+    public int? PrebufferMaxSegmentChars { get; set; }
     public int Volume { get; set; } = 100;
     public object EscapeRules { get; set; } = "";
     public bool TopMost { get; set; } = false;

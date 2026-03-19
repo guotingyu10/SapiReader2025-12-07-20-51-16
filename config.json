@@ -1,6 +1,6 @@
 {
-  "HotkeyIndex": 0,
-  "StopHotkeyIndex": 2,
+  "HotkeyIndex": "F1",
+  "StopHotkeyIndex": "F3",
  "AutoReadHotkeyIndex": "Ctrl+Alt+S",
   "ChineseVoiceName": "Microsoft Xiaoxiao",
   "EnglishVoiceName": "Microsoft Jenny",
@@ -8,6 +8,8 @@
   "MixedChineseMinChars": 1,
   "MixedEnglishMinLetters": 1,
   "WarmUpVoices": true,
+  "sapi-reader.log":false,
+  "version":"2026.3.19-10.58.25",
   "Prevent the speaker from going into sleep mode":true,
   "ChineseVoiceRate": 10,
   "EnglishVoiceRate": 5,
