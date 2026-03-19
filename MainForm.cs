@@ -195,8 +195,35 @@ public partial class MainForm : Form
     protected override void OnLoad(EventArgs e)
     {
         Log("OnLoad Started");
+        TrySetRealtimePriorityOnStartup();
         base.OnLoad(e);
         Log("OnLoad Done");
+    }
+
+    private void TrySetRealtimePriorityOnStartup()
+    {
+        try
+        {
+            var proc = Process.GetCurrentProcess();
+            var before = proc.PriorityClass;
+
+            try
+            {
+                proc.PriorityClass = ProcessPriorityClass.RealTime;
+            }
+            catch
+            {
+                try { proc.PriorityClass = ProcessPriorityClass.High; }
+                catch { }
+            }
+
+            var after = proc.PriorityClass;
+            Log($"ProcessPriority before={before} after={after}");
+        }
+        catch (Exception ex)
+        {
+            Log($"ProcessPriority error {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     protected override void OnShown(EventArgs e)
