@@ -1,0 +1,20 @@
+yarn test:e2e -- e2e/text-wrap-consistency.spec.ts --grep "response speed" --reporter=line
+yarn test:e2e -- e2e/text-wrap-
+consistency.spec.ts --grep "response
+speed" --reporter=line
+yarn test:e2e -- e2e/text-wrap-consistency.spec.ts --grep "double click inserts caret" --reporter=line
+yarn test:e2e -- e2e/test-wrap-consisitecy.spec.ts --grep 'double click inserts caret" --reporter=line yarn test:e2e --e2e/test-wrap-
+yarn test:e2e 
+yarn test:e2e
+-- e2e/test-wrap-consisitecy.spec.ts 
+-- e2e/test-wrap-consistency.spec.ts
+-- e2e/test-wrap-consistency.spec.ts
+--grep 'double click inserts caret" 
+--grep 'double click inserts caret"
+--grep 'double click inserts caret"
+--reporter=line yarn test:e2e --e2e/test-wrap-
+--reporter=line yarn test:e2e --e2e/test-wrap-
+yarn test:typecheck -- --pretty false
+yarn test:typecheck -- --pretty false
+yarn test:typecheck -- --pretty false
+yarn tset:typecheck -- --pretty false

@@ -1,0 +1,22 @@
+中英文混合的文章精选一篇英语文章通常可分为三个局部,即开头、正文和结尾。下面是我带来的中英文混合的文章，欢迎阅读!　　Find the Beauty Around You发现身边的美A very special teacher in a high school had a husband who died suddenly of a heart attack. About a week after his death, she shared some of her thoughts with a class of students. As the late afternoon sunlight shined through the classroom windows, and when the class was nearly over, she moved a few things aside on her desk and sat down there.
+一个很特别的高中教师，其丈夫死于突发性心脏病。在他死后大约一周，她，便把她的一些所思所想讲给全班学生。下午的阳光透过教室的窗户照射进来，快要放学了，她把一些东西放在讲桌上，坐了下来。With a gentle look on her face, she paused and said, "Before class is over, I would like to share with all of you a thought which I feel is very important. Each of us is put here on earth to learn, share, love, appreciate and give of ourselves... and none of us knows when this fantastic experience will end. It can be taken away at any moment. Perhaps this is a sign that we mustmake the most use of every single day."
+她脸上带着温柔的表情，稍稍停顿了一下，便开场讲话:"在放学前，我想跟你们分享一种我认为很重要的想法。我们每个人都生活在地球上，学习、分享、保护别人，欣赏和付出自我，却没有一个人知道这种美好的体验什么时候就会完毕了。它随时都可能被带走。也许这预示着我们必须最大限度地利用每一个日子。 "Her eyes beginning to water, she went on, "So I would like you all to make me a promise: from now on, on your way to school， or on your way home, find something beautiful to notice. It doesn't have to be something you see -it could be a scent perhaps of freshly baked bread wafting out of someone 's house, or it could be the sound of the breeze slightly rustling the leaves in the trees, or the way the morning light catches one autumn leaf as it falls gently to the ground. Please, look for these things, and remember them."
+
+
+dotnet run -c Debug
+dotnet run
+
+注释掉保存朗读记录的功能;进一步降低朗读延迟;
+
+python .\response-speed-test\measure_response_latency.py
+
+
+python -m py_compile "response-speed-test\measure_response_latency.py"
+
+让“获取文本”不再强依赖剪贴板（例如 UIAutomation/直接读取目标窗口选区文本；或走你现在已有的控制 API：直接把文本传给程序，不再 Ctrl+C）。之后再把朗读的文本传到剪贴板;确保F1保持"复制"功能;
+
+
+
+
+
+

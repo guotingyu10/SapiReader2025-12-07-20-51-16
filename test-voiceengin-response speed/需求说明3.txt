@@ -1,0 +1,34 @@
+
+
+dotnet build ".\test-voiceengin-response speed\VoiceEngineResponseSpeed.csproj" -c Release
+
+
+
+
+dotnet run -c Release --project ".\test-voiceengin-response speed\VoiceEngineResponseSpeed.csproj" -- --iterations 5 --output null
+
+
+
+
+dotnet run -c Release --project ".\test-voiceengin-response speed\VoiceEngineResponseSpeed.csproj" -- --voice-contains "Microsoft" --iterations 3 --timeout-ms 8000
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

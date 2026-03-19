@@ -3,6 +3,9 @@ using System.Speech.Synthesis;
 using System.Text.Json;
 using System.Diagnostics;
 using System.Media;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace SapiReader;
@@ -20,6 +23,56 @@ public partial class MainForm : Form
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GUITHREADINFO
+    {
+        public uint cbSize;
+        public uint flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int left;
+        public int top;
+        public int right;
+        public int bottom;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageW(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageW(IntPtr hWnd, int Msg, out int wParam, out int lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
     private const uint MOD_SHIFT = 0x0004;
@@ -35,10 +88,17 @@ public partial class MainForm : Form
     private const byte VK_HOME = 0x24;
     private const byte VK_END = 0x23;
     private const byte VK_DOWN = 0x28;
+    private const int EM_GETSEL = 0x00B0;
+    private const int SCI_GETSELTEXT = 2161;
+    private const int WM_GETTEXT = 0x000D;
+    private const int WM_GETTEXTLENGTH = 0x000E;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
 
     #endregion
 
     private SpeechSynthesizer _voice = null!;
+    private SpeechSynthesizer? _standbyVoice;
+    private int _standbySynthInProgress = 0;
     private NotifyIcon _trayIcon = null!;
     private bool _isSpeaking = false;
     private bool _isAutoReading = false;
@@ -51,6 +111,7 @@ public partial class MainForm : Form
     private int _englishVoiceRate = 0;
     private int _mixedChineseMinChars = 2;
     private int _mixedEnglishMinLetters = 3;
+    private bool _mixedGranularOutput = true;
     private bool _warmUpVoices = true;
     private bool _preventSpeakerSleep = false;
     private SoundPlayer? _speakerKeepAlivePlayer;
@@ -105,21 +166,15 @@ public partial class MainForm : Form
     private string _logPath = "debug.log";
     private long _logMaxBytes = 5L * 1024 * 1024;
     private bool _logEnabled = true;
+    private TcpListener? _controlListener;
+    private CancellationTokenSource? _controlListenerCts;
+    private int _recreateSynthInProgress = 0;
+    private TaskCompletionSource<bool>? _recreateSynthTcs;
+    private int _hotkeyInProgress = 0;
 
     public MainForm()
     {
-        // 计算配置文件路径
-        // 优先查找当前工作目录（方便开发调试和便携使用）
-        string currentDirConfig = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
-        if (File.Exists(currentDirConfig))
-        {
-            _configPath = currentDirConfig;
-        }
-        else
-        {
-            // 否则使用应用程序所在目录
-            _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
-        }
+        _configPath = ResolveConfigPath();
 
         try
         {
@@ -141,6 +196,66 @@ public partial class MainForm : Form
         LoadConfig();
         Log("LoadConfig Done");
         InitializeConfigWatcher();
+        StartControlApi();
+    }
+
+    private static string ResolveConfigPath()
+    {
+        try
+        {
+            var env = Environment.GetEnvironmentVariable("SAPI_READER_CONFIG");
+            if (!string.IsNullOrWhiteSpace(env))
+            {
+                var p = Path.GetFullPath(env);
+                if (File.Exists(p)) return p;
+            }
+        }
+        catch { }
+
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddCandidatesFrom(string dir, int maxLevels)
+        {
+            try
+            {
+                var current = dir;
+                for (int i = 0; i < maxLevels && !string.IsNullOrWhiteSpace(current); i++)
+                {
+                    var path = Path.Combine(current, "config.json");
+                    if (File.Exists(path))
+                    {
+                        try { candidates.Add(Path.GetFullPath(path)); } catch { candidates.Add(path); }
+                    }
+                    var parent = Directory.GetParent(current);
+                    if (parent == null) break;
+                    current = parent.FullName;
+                }
+            }
+            catch { }
+        }
+
+        AddCandidatesFrom(Directory.GetCurrentDirectory(), 6);
+        AddCandidatesFrom(AppContext.BaseDirectory, 6);
+
+        if (candidates.Count == 0)
+        {
+            return Path.Combine(AppContext.BaseDirectory, "config.json");
+        }
+
+        string best = candidates.First();
+        DateTime bestTime = DateTime.MinValue;
+        foreach (var c in candidates)
+        {
+            DateTime t;
+            try { t = File.GetLastWriteTimeUtc(c); }
+            catch { continue; }
+            if (t > bestTime)
+            {
+                bestTime = t;
+                best = c;
+            }
+        }
+        return best;
     }
 
     private void Log(string message)
@@ -231,6 +346,362 @@ public partial class MainForm : Form
         Log("OnShown Started");
         base.OnShown(e);
         Log("OnShown Done");
+    }
+
+    private void StartControlApi()
+    {
+        try
+        {
+            if (_controlListener != null) return;
+            _controlListenerCts = new CancellationTokenSource();
+            _controlListener = new TcpListener(IPAddress.Loopback, 32123);
+            _controlListener.Start();
+            Log("ControlApi started 127.0.0.1:32123");
+            var token = _controlListenerCts.Token;
+            Task.Run(() => ControlAcceptLoop(token), token);
+        }
+        catch (Exception ex)
+        {
+            Log($"ControlApi start error {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void StopControlApi()
+    {
+        try { _controlListenerCts?.Cancel(); } catch { }
+        try { _controlListener?.Stop(); } catch { }
+        _controlListener = null;
+        try { _controlListenerCts?.Dispose(); } catch { }
+        _controlListenerCts = null;
+    }
+
+    private async Task ControlAcceptLoop(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TcpClient? client = null;
+            try
+            {
+                if (_controlListener == null) return;
+                client = await _controlListener.AcceptTcpClientAsync(token);
+                _ = Task.Run(() => HandleControlClient(client, token), token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { client?.Dispose(); } catch { }
+                return;
+            }
+            catch (Exception ex)
+            {
+                try { client?.Dispose(); } catch { }
+                Log($"ControlApi accept error {ex.GetType().Name}: {ex.Message}");
+                await Task.Delay(200, CancellationToken.None);
+            }
+        }
+    }
+
+    private async Task HandleControlClient(TcpClient client, CancellationToken token)
+    {
+        try
+        {
+            client.NoDelay = true;
+            using var stream = client.GetStream();
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 8192, leaveOpen: true);
+            using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 8192, leaveOpen: true)
+            {
+                AutoFlush = true
+            };
+
+            while (!token.IsCancellationRequested)
+            {
+                string? line;
+                try
+                {
+                    line = await reader.ReadLineAsync(token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                if (line == null) return;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                string cmd = "";
+                JsonElement root;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    root = doc.RootElement.Clone();
+                    if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("cmd", out var cmdProp) && cmdProp.ValueKind == JsonValueKind.String)
+                    {
+                        cmd = cmdProp.GetString() ?? "";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = false, error = $"{ex.GetType().Name}: {ex.Message}" }));
+                    continue;
+                }
+
+                if (cmd == "ping")
+                {
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                if (cmd == "get_state")
+                {
+                    try
+                    {
+                        var state = _voice != null ? _voice.State.ToString() : "null";
+                        await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true, voiceState = state, isSpeaking = _isSpeaking, isAutoReading = _isAutoReading }));
+                    }
+                    catch
+                    {
+                        await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true, voiceState = "unknown", isSpeaking = _isSpeaking, isAutoReading = _isAutoReading }));
+                    }
+                    continue;
+                }
+
+                if (cmd == "set_keepalive")
+                {
+                    bool enable = false;
+                    try
+                    {
+                        if (root.TryGetProperty("enable", out var p) && (p.ValueKind == JsonValueKind.True || p.ValueKind == JsonValueKind.False))
+                        {
+                            enable = p.GetBoolean();
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            _preventSpeakerSleep = enable;
+                            if (enable) StartSpeakerKeepAlive();
+                            else StopSpeakerKeepAlive();
+                        }));
+                    }
+                    catch { }
+
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                if (cmd == "stop")
+                {
+                    bool hardReset = true;
+                    int waitMs = 0;
+                    try
+                    {
+                        if (root.TryGetProperty("hardReset", out var p) && (p.ValueKind == JsonValueKind.True || p.ValueKind == JsonValueKind.False))
+                        {
+                            hardReset = p.GetBoolean();
+                        }
+                        if (root.TryGetProperty("waitMs", out var w) && w.ValueKind == JsonValueKind.Number)
+                        {
+                            waitMs = w.GetInt32();
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        BeginInvoke(new Action(() => StopSpeakingInternal(updateStatus: false, hardReset: hardReset)));
+                    }
+                    catch { }
+                    if (waitMs > 0)
+                    {
+                        try { await Task.Delay(waitMs, token); } catch { }
+                    }
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                if (cmd == "set_voice")
+                {
+                    string voiceName = "";
+                    int? volume = null;
+                    int? rate = null;
+                    bool? autoSwitch = null;
+
+                    try
+                    {
+                        if (root.TryGetProperty("voice", out var v) && v.ValueKind == JsonValueKind.String) voiceName = v.GetString() ?? "";
+                        if (root.TryGetProperty("volume", out var vol) && vol.ValueKind == JsonValueKind.Number) volume = vol.GetInt32();
+                        if (root.TryGetProperty("rate", out var r) && r.ValueKind == JsonValueKind.Number) rate = r.GetInt32();
+                        if (root.TryGetProperty("autoSwitchVoice", out var asv) && (asv.ValueKind == JsonValueKind.True || asv.ValueKind == JsonValueKind.False))
+                        {
+                            autoSwitch = asv.GetBoolean();
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            if (autoSwitch.HasValue) _autoSwitchVoice = autoSwitch.Value;
+                            if (!string.IsNullOrWhiteSpace(voiceName)) SelectVoiceSafe(voiceName);
+                            if (volume.HasValue && volume.Value >= 0 && volume.Value <= 100) _voice.Volume = volume.Value;
+                            if (rate.HasValue) _voice.Rate = ClampRate(rate.Value);
+                        }));
+                    }
+                    catch { }
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                if (cmd == "set_mixed_voices")
+                {
+                    string chineseVoice = "";
+                    string englishVoice = "";
+                    int? chineseRate = null;
+                    int? englishRate = null;
+                    int? volume = null;
+                    int? mixedChineseMinChars = null;
+                    int? mixedEnglishMinLetters = null;
+                    bool warmUp = true;
+
+                    try
+                    {
+                        if (root.TryGetProperty("chineseVoice", out var c) && c.ValueKind == JsonValueKind.String) chineseVoice = c.GetString() ?? "";
+                        if (root.TryGetProperty("englishVoice", out var e) && e.ValueKind == JsonValueKind.String) englishVoice = e.GetString() ?? "";
+                        if (root.TryGetProperty("chineseRate", out var cr) && cr.ValueKind == JsonValueKind.Number) chineseRate = cr.GetInt32();
+                        if (root.TryGetProperty("englishRate", out var er) && er.ValueKind == JsonValueKind.Number) englishRate = er.GetInt32();
+                        if (root.TryGetProperty("volume", out var v) && v.ValueKind == JsonValueKind.Number) volume = v.GetInt32();
+                        if (root.TryGetProperty("mixedChineseMinChars", out var m1) && m1.ValueKind == JsonValueKind.Number) mixedChineseMinChars = m1.GetInt32();
+                        if (root.TryGetProperty("mixedEnglishMinLetters", out var m2) && m2.ValueKind == JsonValueKind.Number) mixedEnglishMinLetters = m2.GetInt32();
+                        if (root.TryGetProperty("warmUp", out var w) && (w.ValueKind == JsonValueKind.True || w.ValueKind == JsonValueKind.False)) warmUp = w.GetBoolean();
+                    }
+                    catch { }
+
+                    try
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            _autoSwitchVoice = true;
+                            if (!string.IsNullOrWhiteSpace(chineseVoice)) _chineseVoiceName = ResolveVoiceName(chineseVoice);
+                            if (!string.IsNullOrWhiteSpace(englishVoice)) _englishVoiceName = ResolveVoiceName(englishVoice);
+                            if (chineseRate.HasValue) _chineseVoiceRate = ClampRate(chineseRate.Value);
+                            if (englishRate.HasValue) _englishVoiceRate = ClampRate(englishRate.Value);
+                            if (mixedChineseMinChars.HasValue) _mixedChineseMinChars = Math.Max(1, mixedChineseMinChars.Value);
+                            if (mixedEnglishMinLetters.HasValue) _mixedEnglishMinLetters = Math.Max(1, mixedEnglishMinLetters.Value);
+                            if (volume.HasValue && volume.Value >= 0 && volume.Value <= 100) _voice.Volume = volume.Value;
+                        }));
+                    }
+                    catch { }
+
+                    if (warmUp)
+                    {
+                        RunStaBackground(() => WarmUpVoices());
+                    }
+
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                if (cmd == "speak")
+                {
+                    string text = "";
+                    bool skipProcessing = false;
+                    bool skipHistory = false;
+                    try
+                    {
+                        if (root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String) text = t.GetString() ?? "";
+                        if (root.TryGetProperty("skipProcessing", out var sp) && (sp.ValueKind == JsonValueKind.True || sp.ValueKind == JsonValueKind.False))
+                        {
+                            skipProcessing = sp.GetBoolean();
+                        }
+                        if (root.TryGetProperty("skipHistory", out var sh) && (sh.ValueKind == JsonValueKind.True || sh.ValueKind == JsonValueKind.False))
+                        {
+                            skipHistory = sh.GetBoolean();
+                        }
+                    }
+                    catch { }
+
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = false, error = "empty_text" }));
+                        continue;
+                    }
+
+                    try
+                    {
+                        BeginInvoke(new Action(() => SpeakFromApi(text, skipProcessing, skipHistory)));
+                    }
+                    catch { }
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = true }));
+                    continue;
+                }
+
+                await writer.WriteLineAsync(JsonSerializer.Serialize(new { ok = false, error = "unknown_cmd" }));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"ControlApi client error {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            try { client.Dispose(); } catch { }
+        }
+    }
+
+    private async void SpeakFromApi(string text, bool skipProcessing, bool skipHistory)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            _isAutoReading = false;
+            CancelCurrentOperation();
+            StopBufferedPlayback();
+            CancelPendingStopReset();
+            try { _voice?.SpeakAsyncCancelAll(); } catch { }
+            _isSpeaking = false;
+            string rawText = text;
+            if (_onlyReadFirstLine)
+            {
+                int newlineIndex = rawText.IndexOfAny(new[] { '\r', '\n' });
+                if (newlineIndex >= 0) rawText = rawText.Substring(0, newlineIndex);
+            }
+            if (_removeSpaces)
+            {
+                rawText = rawText.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
+            }
+
+            var cts = new CancellationTokenSource();
+            _operationCts = cts;
+            var token = cts.Token;
+
+            string processedText;
+            if (skipProcessing)
+            {
+                _statusLabel.Text = "正在朗读...";
+                _statusLabel.ForeColor = Color.Blue;
+                processedText = rawText;
+            }
+            else
+            {
+                _statusLabel.Text = "正在处理文本...";
+                _statusLabel.ForeColor = Color.Blue;
+                processedText = await Task.Run(() => ApplyEscapeRules(rawText, token), token);
+                if (token.IsCancellationRequested) return;
+            }
+
+            if (!skipHistory) AddReadingRecord(processedText);
+            SpeakText(processedText);
+            Log($"ApiSpeak len={processedText.Length} skipProcessing={skipProcessing} ms={sw.ElapsedMilliseconds}");
+        }
+        catch (Exception ex)
+        {
+            _isSpeaking = false;
+            Log($"ApiSpeak error {ex.GetType().Name}: {ex.Message}");
+            _statusLabel.Text = $"错误: {ex.Message}";
+            _statusLabel.ForeColor = Color.Red;
+        }
     }
 
     private void InitializeComponent()
@@ -347,9 +818,11 @@ public partial class MainForm : Form
     private void InitializeVoice()
     {
         _voice = new SpeechSynthesizer();
+        try { _voice.SetOutputToDefaultAudioDevice(); } catch { }
         // 获取发音人列表供查询
         _installedVoices = _voice.GetInstalledVoices().Where(v => v.Enabled).ToList();
         AttachVoiceEvents(_voice);
+        EnsureStandbySynth();
     }
 
     private void ListVoices_Click(object? sender, EventArgs e)
@@ -506,52 +979,29 @@ public partial class MainForm : Form
 
     private async void HandleHotkey()
     {
+        if (Interlocked.Exchange(ref _hotkeyInProgress, 1) == 1)
+        {
+            Log("HandleHotkey skipped reason=in_progress");
+            return;
+        }
         var sw = Stopwatch.StartNew();
-        Log("HandleHotkey start");
-        StopSpeakingInternal(updateStatus: false, hardReset: false);
-        Log($"HandleHotkey stop_ms={sw.ElapsedMilliseconds}");
-
         try
         {
-            _previousClipboard = null;
-            try
-            {
-                var data = Clipboard.GetDataObject();
-                if (data != null) _previousClipboard = data;
-            }
-            catch {}
+            Log("HandleHotkey start");
+            var stopTask = StopSpeakingFastAsync(updateStatus: false);
 
-            // 优化: 先清空剪贴板，以便检测新内容是否已复制
-            try { Clipboard.Clear(); } catch {}
-
-            SimulateCtrlC();
-            
-            // 优化: 轮询检查剪贴板，代替固定延迟 (提高响应速度)
-            string text = "";
-            for (int i = 0; i < 20; i++) // 最多等待 400ms
-            {
-                await Task.Delay(20);
-                if (Clipboard.ContainsText())
-                {
-                    string t = Clipboard.GetText();
-                    if (!string.IsNullOrWhiteSpace(t))
-                    {
-                        text = t;
-                        break;
-                    }
-                }
-            }
+            string text = await GetSelectedTextPreferUiaAsync(timeoutMs: 350);
 
             if (string.IsNullOrWhiteSpace(text))
             {
-                _statusLabel.Text = "剪贴板为空";
+                _statusLabel.Text = "未获取到选中文本";
                 _statusLabel.ForeColor = Color.Orange;
-                Log("HandleHotkey clipboard empty");
+                Log("HandleHotkey selection empty");
                 await Task.Delay(2000);
                 UpdateStatusLabel();
                 return;
             }
-            Log($"HandleHotkey clipboard length={text.Length} clipboard_ms={sw.ElapsedMilliseconds}");
+            Log($"HandleHotkey selection length={text.Length} selection_ms={sw.ElapsedMilliseconds}");
             
             if (_onlyReadFirstLine)
             {
@@ -563,6 +1013,8 @@ public partial class MainForm : Form
             {
                 text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
             }
+
+            await TrySetClipboardTextWithRetryAsync(text, retries: 15, delayMs: 30);
 
             CancelCurrentOperation();
             var cts = new CancellationTokenSource();
@@ -578,15 +1030,8 @@ public partial class MainForm : Form
 
             AddReadingRecord(processedText);
 
-            if (_clearClipboard)
-            {
-                try
-                {
-                    if (_previousClipboard != null) Clipboard.SetDataObject(_previousClipboard, true);
-                    else Clipboard.Clear();
-                }
-                catch {}
-            }
+            await stopTask;
+            Log($"HandleHotkey stop_ms={sw.ElapsedMilliseconds}");
 
             SpeakText(processedText);
             Log($"HandleHotkey speak_called_ms={sw.ElapsedMilliseconds}");
@@ -605,6 +1050,306 @@ public partial class MainForm : Form
                 UpdateStatusLabel();
             }
         }
+        finally
+        {
+            Interlocked.Exchange(ref _hotkeyInProgress, 0);
+        }
+    }
+
+    private async Task<string> GetSelectedTextPreferUiaAsync(int timeoutMs)
+    {
+        string? text = null;
+        try
+        {
+            var task = Task.Run(() => GetSelectedTextFromFocusedControlWithTimeout(timeoutMs));
+            var completed = await Task.WhenAny(task, Task.Delay(timeoutMs));
+            if (completed == task) text = await task;
+        }
+        catch { }
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+
+        return await GetSelectedTextViaClipboardFallbackAsync();
+    }
+
+    private string? GetSelectedTextFromFocusedControlWithTimeout(int timeoutMs)
+    {
+        try
+        {
+            var hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return null;
+            var threadId = GetWindowThreadProcessId(hwnd, out _);
+            var info = new GUITHREADINFO { cbSize = (uint)Marshal.SizeOf<GUITHREADINFO>() };
+            if (!GetGUIThreadInfo(threadId, ref info)) return null;
+            if (info.hwndFocus == IntPtr.Zero) return null;
+
+            var cls = new StringBuilder(256);
+            _ = GetClassNameW(info.hwndFocus, cls, cls.Capacity);
+            var className = cls.ToString();
+            if (className.IndexOf("Scintilla", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return GetSelectedTextFromScintilla(info.hwndFocus, timeoutMs);
+            }
+            if (className.Equals("Edit", StringComparison.OrdinalIgnoreCase) || className.IndexOf("RichEdit", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return GetSelectedTextFromEditLike(info.hwndFocus, timeoutMs);
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    private string? GetSelectedTextFromEditLike(IntPtr hwnd, int timeoutMs)
+    {
+        try
+        {
+            var startPtr = Marshal.AllocHGlobal(sizeof(int));
+            var endPtr = Marshal.AllocHGlobal(sizeof(int));
+            try
+            {
+                Marshal.WriteInt32(startPtr, 0);
+                Marshal.WriteInt32(endPtr, 0);
+                if (SendMessageTimeoutW(hwnd, EM_GETSEL, startPtr, endPtr, SMTO_ABORTIFHUNG, (uint)timeoutMs, out _) == IntPtr.Zero)
+                {
+                    return null;
+                }
+                int start = Marshal.ReadInt32(startPtr);
+                int end = Marshal.ReadInt32(endPtr);
+            if (end <= start) return null;
+
+                if (SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, (uint)timeoutMs, out var lenRes) == IntPtr.Zero)
+                {
+                    return null;
+                }
+                int len = lenRes.ToInt32();
+                if (len <= 0) return null;
+                var buf = Marshal.AllocHGlobal((len + 1) * 2);
+                try
+                {
+                    if (SendMessageTimeoutW(hwnd, WM_GETTEXT, (IntPtr)(len + 1), buf, SMTO_ABORTIFHUNG, (uint)timeoutMs, out _) == IntPtr.Zero)
+                    {
+                        return null;
+                    }
+                    var full = Marshal.PtrToStringUni(buf, len) ?? "";
+
+            if (start < 0) start = 0;
+            if (end > full.Length) end = full.Length;
+            if (end <= start) return null;
+            return full.Substring(start, end - start);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buf);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(startPtr);
+                Marshal.FreeHGlobal(endPtr);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string? GetSelectedTextFromScintilla(IntPtr hwnd, int timeoutMs)
+    {
+        try
+        {
+            if (SendMessageTimeoutW(hwnd, SCI_GETSELTEXT, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, (uint)timeoutMs, out var lenRes) == IntPtr.Zero)
+            {
+                return null;
+            }
+            int byteLen = lenRes.ToInt32();
+            if (byteLen <= 1) return null;
+            var buf = Marshal.AllocHGlobal(byteLen + 2);
+            try
+            {
+                if (SendMessageTimeoutW(hwnd, SCI_GETSELTEXT, IntPtr.Zero, buf, SMTO_ABORTIFHUNG, (uint)timeoutMs, out _) == IntPtr.Zero)
+                {
+                    return null;
+                }
+                var bytes = new byte[byteLen];
+                Marshal.Copy(buf, bytes, 0, byteLen);
+                var s = Encoding.UTF8.GetString(bytes).TrimEnd('\0');
+                if (string.IsNullOrWhiteSpace(s)) return null;
+                return s;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<string> GetSelectedTextViaClipboardFallbackAsync()
+    {
+        try { SimulateCtrlC(); } catch { }
+
+        for (int i = 0; i < 25; i++)
+        {
+            await Task.Delay(20);
+            try
+            {
+                if (Clipboard.ContainsText())
+                {
+                    var t = Clipboard.GetText();
+                    if (!string.IsNullOrWhiteSpace(t)) return t;
+                }
+            }
+            catch (ExternalException)
+            {
+            }
+            catch
+            {
+            }
+        }
+
+        return "";
+    }
+
+    private async Task<bool> TrySetClipboardTextWithRetryAsync(string text, int retries, int delayMs)
+    {
+        for (int i = 0; i < retries; i++)
+        {
+            try
+            {
+                Clipboard.SetText(text);
+                return true;
+            }
+            catch (ExternalException)
+            {
+                await Task.Delay(delayMs);
+            }
+            catch
+            {
+                await Task.Delay(delayMs);
+            }
+        }
+        return false;
+    }
+
+    private async Task StopSpeakingFastAsync(bool updateStatus)
+    {
+        _isAutoReading = false;
+        CancelCurrentOperation();
+        StopBufferedPlayback();
+        CancelPendingStopReset();
+
+        if (Volatile.Read(ref _recreateSynthInProgress) == 1)
+        {
+            await WaitForRecreateSynthAsync(timeoutMs: 6000);
+        }
+
+        var voice = _voice;
+        bool isSpeakingNow = false;
+        try { if (voice != null) isSpeakingNow = voice.State == SynthesizerState.Speaking; } catch { }
+
+        if (isSpeakingNow)
+        {
+            TryMuteSynthImmediate(voice);
+            if (TrySwapInStandbySynth())
+            {
+                EnsureStandbySynth();
+            }
+            else
+            {
+                EnsureStandbySynth();
+                bool okStandby = await WaitForStandbySynthAsync(timeoutMs: 6000);
+                if (okStandby && TrySwapInStandbySynth())
+                {
+                    EnsureStandbySynth();
+                }
+                else
+                {
+                    RecreateSpeechSynthesizer();
+                    bool ok = await WaitForRecreateSynthAsync(timeoutMs: 6000);
+                    if (!ok) Log("StopSpeakingFastAsync hard_reset_timeout");
+                    EnsureStandbySynth();
+                }
+            }
+        }
+        else
+        {
+            var cancelTask = Task.Run(() =>
+            {
+                try { voice?.SpeakAsyncCancelAll(); } catch { }
+            });
+
+            var completed = await Task.WhenAny(cancelTask, Task.Delay(250));
+            if (completed != cancelTask)
+            {
+                Log("StopSpeakingFastAsync soft_cancel_timeout -> hard_reset_synth");
+                TryMuteSynthImmediate(voice);
+                if (TrySwapInStandbySynth())
+                {
+                    EnsureStandbySynth();
+                }
+                else
+                {
+                    EnsureStandbySynth();
+                    bool okStandby = await WaitForStandbySynthAsync(timeoutMs: 6000);
+                    if (okStandby && TrySwapInStandbySynth())
+                    {
+                        EnsureStandbySynth();
+                    }
+                    else
+                    {
+                        RecreateSpeechSynthesizer();
+                        bool ok = await WaitForRecreateSynthAsync(timeoutMs: 6000);
+                        if (!ok) Log("StopSpeakingFastAsync hard_reset_timeout");
+                        EnsureStandbySynth();
+                    }
+                }
+            }
+            else
+            {
+                ScheduleForceResetSynthIfStuck();
+            }
+        }
+
+        _isSpeaking = false;
+        if (updateStatus) UpdateStatusLabel();
+    }
+
+    private void TryMuteSynthImmediate(SpeechSynthesizer? synth)
+    {
+        try { if (synth != null) synth.Volume = 0; } catch { }
+
+        Task.Run(() =>
+        {
+            try { synth?.SetOutputToNull(); } catch { }
+            try { synth?.SpeakAsyncCancelAll(); } catch { }
+        });
+    }
+
+    private async Task<bool> WaitForRecreateSynthAsync(int timeoutMs)
+    {
+        try
+        {
+            var tcs = Volatile.Read(ref _recreateSynthTcs);
+            if (tcs == null) return true;
+            var completed = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            if (completed == tcs.Task)
+            {
+                await tcs.Task;
+                return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void StopSpeaking()
@@ -622,7 +1367,16 @@ public partial class MainForm : Form
         if (hardReset)
         {
             Log("StopSpeakingInternal action=hard_reset_synth");
-            RecreateSpeechSynthesizer();
+            TryMuteSynthImmediate(_voice);
+            if (TrySwapInStandbySynth())
+            {
+                EnsureStandbySynth();
+            }
+            else
+            {
+                RecreateSpeechSynthesizer();
+                EnsureStandbySynth();
+            }
             _isSpeaking = false;
             if (updateStatus) UpdateStatusLabel();
             return;
@@ -670,33 +1424,137 @@ public partial class MainForm : Form
         catch { }
     }
 
-    private void RecreateSpeechSynthesizer()
+    private void RunStaBackground(Action action)
     {
         try
         {
-            var old = _voice;
+            var thread = new Thread(() =>
+            {
+                try { action(); }
+                catch (Exception ex) { Log($"StaBackground error {ex.GetType().Name}: {ex.Message}"); }
+            })
+            {
+                IsBackground = true
+            };
+            try { thread.SetApartmentState(ApartmentState.STA); } catch { }
+            thread.Start();
+        }
+        catch { }
+    }
+
+    private void EnsureStandbySynth()
+    {
+        if (_standbyVoice != null) return;
+        if (Interlocked.Exchange(ref _standbySynthInProgress, 1) == 1) return;
+
+        RunStaBackground(() =>
+        {
+            SpeechSynthesizer? standby = null;
+            try
+            {
+                standby = new SpeechSynthesizer();
+                try { standby.SetOutputToDefaultAudioDevice(); } catch { }
+                AttachVoiceEvents(standby);
+                ApplyBaseConfigToSynth(standby);
+            }
+            catch
+            {
+                try { standby?.Dispose(); } catch { }
+                standby = null;
+            }
+            finally
+            {
+                if (standby != null)
+                {
+                    var old = Interlocked.Exchange(ref _standbyVoice, standby);
+                    DisposeOldSynthAsync(old);
+                    Log("StandbySynth ready");
+                }
+                Interlocked.Exchange(ref _standbySynthInProgress, 0);
+            }
+        });
+    }
+
+    private bool TrySwapInStandbySynth()
+    {
+        var standby = Interlocked.Exchange(ref _standbyVoice, null);
+        if (standby == null) return false;
+
+        var old = Interlocked.Exchange(ref _voice, standby);
+        TryMuteSynthImmediate(old);
+        DisposeOldSynthAsync(old);
+        Log("SwapInStandbySynth ok");
+        return true;
+    }
+
+    private async Task<bool> WaitForStandbySynthAsync(int timeoutMs)
+    {
+        if (_standbyVoice != null) return true;
+        if (timeoutMs <= 0) return false;
+
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            if (_standbyVoice != null) return true;
+            await Task.Delay(50);
+        }
+        return _standbyVoice != null;
+    }
+
+    private void RecreateSpeechSynthesizer()
+    {
+        if (Interlocked.Exchange(ref _recreateSynthInProgress, 1) == 1) return;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _recreateSynthTcs = tcs;
+        var old = _voice;
+        RunStaBackground(() =>
+        {
+            SpeechSynthesizer? next = null;
             try { old?.SetOutputToNull(); } catch { }
             try { if (old != null) old.Volume = 0; } catch { }
             try { old?.SpeakAsyncCancelAll(); } catch { }
 
-            var next = new SpeechSynthesizer();
-            try { next.SetOutputToDefaultAudioDevice(); } catch { }
-            AttachVoiceEvents(next);
-            ApplyBaseConfigToSynth(next);
-
-            _voice = next;
-            if (_installedVoices.Count == 0)
+            try
             {
-                try { _installedVoices = next.GetInstalledVoices().Where(v => v.Enabled).ToList(); } catch { }
+                next = new SpeechSynthesizer();
+                try { next.SetOutputToDefaultAudioDevice(); } catch { }
+                AttachVoiceEvents(next);
+                ApplyBaseConfigToSynth(next);
             }
+            catch { }
 
-            DisposeOldSynthAsync(old);
-            Log($"RecreateSpeechSynthesizer done state={_voice.State}");
-        }
-        catch (Exception ex)
-        {
-            Log($"RecreateSpeechSynthesizer error {ex.GetType().Name}: {ex.Message}");
-        }
+            try
+            {
+                try
+                {
+                    if (next != null)
+                    {
+                        Interlocked.Exchange(ref _voice, next);
+                        if (_installedVoices.Count == 0)
+                        {
+                            try { _installedVoices = next.GetInstalledVoices().Where(v => v.Enabled).ToList(); } catch { }
+                        }
+                        DisposeOldSynthAsync(old);
+                        Log($"RecreateSpeechSynthesizer done state={_voice.State}");
+                        tcs.TrySetResult(true);
+                    }
+                    else
+                    {
+                        Log("RecreateSpeechSynthesizer failed next=null");
+                        tcs.TrySetResult(false);
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _recreateSynthInProgress, 0);
+                }
+            }
+            catch
+            {
+                tcs.TrySetResult(false);
+                Interlocked.Exchange(ref _recreateSynthInProgress, 0);
+            }
+        });
     }
 
     private void CancelCurrentOperation()
@@ -746,12 +1604,16 @@ public partial class MainForm : Form
     {
         if (_lastAppliedConfig == null) return;
         try { synth.Volume = _lastAppliedConfig.Volume; } catch { }
-        try { synth.Rate = ClampRate(_lastAppliedConfig.Rate); } catch { }
         try
         {
-            if (!string.IsNullOrWhiteSpace(_lastAppliedConfig.VoiceName))
+            var desiredChinese = string.IsNullOrWhiteSpace(_lastAppliedConfig.ChineseVoiceName) ? _lastAppliedConfig.VoiceName : _lastAppliedConfig.ChineseVoiceName;
+            var desiredSingle = !_lastAppliedConfig.AutoSwitchVoice && !string.IsNullOrWhiteSpace(desiredChinese) ? desiredChinese : _lastAppliedConfig.VoiceName;
+
+            try { synth.Rate = ClampRate(_lastAppliedConfig.AutoSwitchVoice ? _lastAppliedConfig.Rate : (_lastAppliedConfig.ChineseVoiceRate ?? _lastAppliedConfig.Rate)); } catch { }
+
+            if (!string.IsNullOrWhiteSpace(desiredSingle))
             {
-                try { synth.SelectVoice(_lastAppliedConfig.VoiceName); } catch { }
+                try { synth.SelectVoice(desiredSingle); } catch { }
             }
         }
         catch { }
@@ -877,23 +1739,7 @@ public partial class MainForm : Form
     {
         try
         {
-            _previousClipboard = null;
-            try
-            {
-                var data = Clipboard.GetDataObject();
-                if (data != null) _previousClipboard = data;
-            }
-            catch {}
-
-            // 2. 复制
-            SimulateCtrlC();
-            await Task.Delay(150);
-
-            string text = "";
-            if (Clipboard.ContainsText())
-            {
-                text = Clipboard.GetText();
-            }
+            string text = await GetSelectedTextPreferUiaAsync(timeoutMs: 250);
 
             if (string.IsNullOrWhiteSpace(text))
             {
@@ -945,27 +1791,28 @@ public partial class MainForm : Form
         UnregisterHotKey(this.Handle, AUTO_READ_HOTKEY_ID);
         _trayIcon.Visible = false;
         CancelCurrentOperation();
+        StopControlApi();
         StopSpeakerKeepAlive();
         base.OnFormClosed(e);
     }
 
     private void AddReadingRecord(string text)
     {
-        var record = new ReadingRecord
-        {
-            Time = DateTime.Now,
-            Text = text.Length > 100 ? text.Substring(0, 100) + "..." : text
-        };
-
-        if (_readingHistory.Count >= _maxHistory)
-        {
-            _readingHistory.RemoveAt(0);
-            _historyListBox.Items.RemoveAt(0);
-        }
-
-        _readingHistory.Add(record);
-        _historyListBox.Items.Add($"[{record.Time:HH:mm:ss}] {record.Text}");
-        _historyListBox.TopIndex = _historyListBox.Items.Count - 1;
+        // var record = new ReadingRecord
+        // {
+        //     Time = DateTime.Now,
+        //     Text = text.Length > 100 ? text.Substring(0, 100) + "..." : text
+        // };
+        //
+        // if (_readingHistory.Count >= _maxHistory)
+        // {
+        //     _readingHistory.RemoveAt(0);
+        //     _historyListBox.Items.RemoveAt(0);
+        // }
+        //
+        // _readingHistory.Add(record);
+        // _historyListBox.Items.Add($"[{record.Time:HH:mm:ss}] {record.Text}");
+        // _historyListBox.TopIndex = _historyListBox.Items.Count - 1;
     }
 
     private void LoadEscapeRules(object input)
@@ -1362,14 +2209,17 @@ public partial class MainForm : Form
         // 2. 语音参数
         if (_voice != null)
         {
-            _voice.Rate = ClampRate(config.Rate);
+            var desiredChineseForSingle = string.IsNullOrWhiteSpace(config.ChineseVoiceName) ? config.VoiceName : config.ChineseVoiceName;
+            var desiredSingle = !config.AutoSwitchVoice && !string.IsNullOrWhiteSpace(desiredChineseForSingle) ? desiredChineseForSingle : config.VoiceName;
+
+            _voice.Rate = ClampRate(config.AutoSwitchVoice ? config.Rate : (config.ChineseVoiceRate ?? config.Rate));
             if (config.Volume >= 0 && config.Volume <= 100) _voice.Volume = config.Volume;
             
-            if (!string.IsNullOrEmpty(config.VoiceName))
+            if (!string.IsNullOrEmpty(desiredSingle))
             {
                 try
                 {
-                    _voice.SelectVoice(config.VoiceName);
+                    _voice.SelectVoice(desiredSingle);
                 }
                 catch {}
             }
@@ -1404,12 +2254,13 @@ public partial class MainForm : Form
         _englishVoiceRate = ClampRate(config.EnglishVoiceRate ?? config.Rate);
         _mixedChineseMinChars = config.MixedChineseMinChars is int zhMin ? Math.Max(1, zhMin) : 2;
         _mixedEnglishMinLetters = config.MixedEnglishMinLetters is int enMin ? Math.Max(1, enMin) : 3;
+        _mixedGranularOutput = config.MixedGranularOutput ?? true;
         _warmUpVoices = config.WarmUpVoices ?? true;
         if (_warmUpVoices)
         {
             try
             {
-                BeginInvoke(new Action(() => WarmUpVoices()));
+                RunStaBackground(() => WarmUpVoices());
             }
             catch { }
         }
@@ -1427,11 +2278,16 @@ public partial class MainForm : Form
         Log($"ApplyConfig readKey={VkToDisplay(_hotkeyKey)} stopKey={VkToDisplay(_stopHotkeyKey)} autoRead={_customAutoReadHotKey}");
         Log($"ApplyConfig zhVoice={_chineseVoiceName} enVoice={_englishVoiceName} zhRate={_chineseVoiceRate} enRate={_englishVoiceRate}");
         Log($"ApplyConfig prebufferMixed={_prebufferMixedAudio} minLen={_prebufferMinTextLength} maxSeg={_prebufferMaxSegmentChars} keepAlive={_preventSpeakerSleep}");
+
+        var oldStandby = Interlocked.Exchange(ref _standbyVoice, null);
+        DisposeOldSynthAsync(oldStandby);
+        EnsureStandbySynth();
     }
 
     private void SpeakText(string text)
     {
         CancelPendingStopReset();
+        try { _voice.SpeakAsyncCancelAll(); } catch { }
         if (!_autoSwitchVoice)
         {
             _voice.SpeakAsync(text);
@@ -1622,38 +2478,167 @@ public partial class MainForm : Form
             if (segments.Count == 0) return null;
 
             var prompt = new PromptBuilder();
+            string activeVoice = "";
+            int activeRate = 0;
+            bool voiceOpen = false;
+            bool styleOpen = false;
+
             foreach (var segment in segments)
             {
                 var voiceName = segment.Kind == TextKind.Chinese ? _chineseVoiceName : _englishVoiceName;
                 var rate = segment.Kind == TextKind.Chinese ? _chineseVoiceRate : _englishVoiceRate;
                 if (string.IsNullOrWhiteSpace(voiceName))
                 {
-                    prompt.AppendText(segment.Text);
+                    if (voiceOpen)
+                    {
+                        try { if (styleOpen) prompt.EndStyle(); } catch { }
+                        try { prompt.EndVoice(); } catch { }
+                        voiceOpen = false;
+                        styleOpen = false;
+                        activeVoice = "";
+                        activeRate = 0;
+                    }
+                    AppendSegmentText(prompt, segment);
                     continue;
                 }
 
                 try
                 {
-                    prompt.StartVoice(voiceName);
-                    var style = new PromptStyle
+                    if (!voiceOpen || !string.Equals(activeVoice, voiceName, StringComparison.OrdinalIgnoreCase) || activeRate != rate)
                     {
-                        Rate = MapPromptRate(rate)
-                    };
-                    prompt.StartStyle(style);
-                    prompt.AppendText(segment.Text);
-                    prompt.EndStyle();
-                    prompt.EndVoice();
+                        if (voiceOpen)
+                        {
+                            try { if (styleOpen) prompt.EndStyle(); } catch { }
+                            try { prompt.EndVoice(); } catch { }
+                            voiceOpen = false;
+                            styleOpen = false;
+                        }
+
+                        prompt.StartVoice(voiceName);
+                        voiceOpen = true;
+                        activeVoice = voiceName;
+                        activeRate = rate;
+
+                        var style = new PromptStyle { Rate = MapPromptRate(rate) };
+                        prompt.StartStyle(style);
+                        styleOpen = true;
+                    }
+                    AppendSegmentText(prompt, segment);
                 }
                 catch
                 {
-                    prompt.AppendText(segment.Text);
+                    if (voiceOpen)
+                    {
+                        try { if (styleOpen) prompt.EndStyle(); } catch { }
+                        try { prompt.EndVoice(); } catch { }
+                        voiceOpen = false;
+                        styleOpen = false;
+                        activeVoice = "";
+                        activeRate = 0;
+                    }
+                    AppendSegmentText(prompt, segment);
                 }
+            }
+
+            if (voiceOpen)
+            {
+                try { if (styleOpen) prompt.EndStyle(); } catch { }
+                try { prompt.EndVoice(); } catch { }
             }
             return prompt;
         }
         catch
         {
             return null;
+        }
+    }
+
+    private void AppendSegmentText(PromptBuilder prompt, TextSegment segment)
+    {
+        if (!_mixedGranularOutput)
+        {
+            prompt.AppendText(segment.Text);
+            return;
+        }
+
+        if (segment.Kind == TextKind.Chinese)
+        {
+            AppendChineseCharByChar(prompt, segment.Text);
+            return;
+        }
+
+        AppendEnglishWordByWord(prompt, segment.Text);
+    }
+
+    private static void AppendChineseCharByChar(PromptBuilder prompt, string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+
+        var neutral = new StringBuilder();
+        foreach (var ch in text)
+        {
+            if (IsChineseChar(ch))
+            {
+                if (neutral.Length > 0)
+                {
+                    prompt.AppendText(neutral.ToString());
+                    neutral.Clear();
+                }
+                prompt.AppendText(ch.ToString());
+            }
+            else
+            {
+                neutral.Append(ch);
+            }
+        }
+
+        if (neutral.Length > 0)
+        {
+            prompt.AppendText(neutral.ToString());
+        }
+    }
+
+    private static void AppendEnglishWordByWord(PromptBuilder prompt, string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+
+        var word = new StringBuilder();
+        var neutral = new StringBuilder();
+
+        static bool IsWordChar(char ch)
+        {
+            return IsLatinLetter(ch) || char.IsDigit(ch) || ch == '\'' || ch == '-';
+        }
+
+        foreach (var ch in text)
+        {
+            if (IsWordChar(ch))
+            {
+                if (neutral.Length > 0)
+                {
+                    prompt.AppendText(neutral.ToString());
+                    neutral.Clear();
+                }
+                word.Append(ch);
+                continue;
+            }
+
+            if (word.Length > 0)
+            {
+                prompt.AppendText(word.ToString());
+                word.Clear();
+            }
+            neutral.Append(ch);
+        }
+
+        if (word.Length > 0)
+        {
+            prompt.AppendText(word.ToString());
+            word.Clear();
+        }
+        if (neutral.Length > 0)
+        {
+            prompt.AppendText(neutral.ToString());
         }
     }
 
@@ -2165,6 +3150,7 @@ public class AppConfig
     public int? EnglishVoiceRate { get; set; }
     public int? MixedChineseMinChars { get; set; }
     public int? MixedEnglishMinLetters { get; set; }
+    public bool? MixedGranularOutput { get; set; }
     public bool? WarmUpVoices { get; set; }
     [JsonPropertyName("Prevent the speaker from going into sleep mode")]
     public bool? PreventSpeakerFromGoingIntoSleepMode { get; set; }

@@ -1,25 +1,25 @@
 {
   "HotkeyIndex": "F1",
   "StopHotkeyIndex": "F3",
- "AutoReadHotkeyIndex": "Ctrl+Alt+S",
+  "AutoReadHotkeyIndex": "Ctrl+Alt+S",
   "ChineseVoiceName": "Microsoft Xiaoxiao",
   "EnglishVoiceName": "Microsoft Jenny",
   "AutoSwitchVoice": true,
   "MixedChineseMinChars": 1,
   "MixedEnglishMinLetters": 1,
   "WarmUpVoices": true,
-  "sapi-reader.log":false,
-  "version":"2026.3.19-12.53.48",
-  "Prevent the speaker from going into sleep mode":true,
+  "sapi-reader.log": true,
+  "version": "2026.3.19-16.54.58中英切换",
+  "Prevent the speaker from going into sleep mode": true,
   "ChineseVoiceRate": 10,
   "EnglishVoiceRate": 5,
   "Volume": 100,
-  "EscapeRules": {
-  },
+  "EscapeRules": {},
   "TopMost": false,
   "OnlyReadFirstLine": false,
   "ClearClipboard": false,
   "RecordNumber": 10,
   "RemoveSpaces": false,
-  "AutoReadDelay": 100
+  "AutoReadDelay": 100,
+  "VoiceName": "Microsoft Aria"
 }

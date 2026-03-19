@@ -35,7 +35,34 @@
 能否将这个软件开启后自动设置实时优先级;
 
 
+
+
+软件在朗读一段时间后按F1,不停止上一次的朗读是怎么回事;
+
+
+
+在response-speed-test文件夹,用python编写一个测试从输入文字到输出音频之间延迟的测试脚本,测试使用真实扬声器,使用100%音量;
+这个脚本将先朗读一大段文字(2000随机中文英文混合),10s之后迅速暂停,朗读新文字;
+循环3次
+使用模拟键盘F1和F3操作这个软件;
+按下F1开始朗读新内容(记录从按下F1到输出音频之间的延迟)
+如果输入输出之间的延迟大于以下发音人延迟的3倍则测试失败;
+运行时记录新的发音人延迟(只看这3个)
+      62.5 ms  Microsoft Jenny
+      62.7 ms  Microsoft Aria
+      62.9 ms  Microsoft Xiaoxiao
+(base) PS D:\a01\00123\2025sapi-reader\SapiReader> 
+
+
+
+分析能否让中文发音人逐字输出,英文发音人逐单词输出,确保切换时不卡顿,降低切换朗读内容的延迟
+
+
+
 dotnet run
+dotnet run -c Debug
+
+
 
 
 dotnet publish -c Release -o ./publish
