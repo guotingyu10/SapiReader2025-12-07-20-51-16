@@ -48,8 +48,44 @@ git remote -v
 
 git remote set-url origin https://github.com/guotingyu10/SapiReader2025-12-07-20-51-16.git 
 git add . 
-git commit -m "Update extension with jump fix" && git push -f origin main
+git commit -m "Update extension with jump fix"
+git push -f origin main
 
 git status; git log -1 --stat
 
 git remote -v
+
+
+git count-objects -vH; git status; git remote -v; git rev-parse --abbrev-ref HEAD
+
+
+
+
+
+
+
+
+git count-objects -vH; git status; git remote -v; git rev-parse --abbrev-ref HEAD
+
+
+
+git stash list; git stash pop; git status; git rev-list --objects --all | Select-String -Pattern "safetensors" -SimpleMatch | Select-Object -First 5
+
+
+
+git cat-file -p d2270ca3255aeb1948812106c7cabafef314084f | Select-Object -First 30; git show --name-status --oneline --no-patch d2270ca3255aeb1948812106c7cabafef314084f; git show --name-status --oneline d2270ca3255aeb1948812106c7cabafef314084f --stat
+
+
+
+
+git restore --source d2270ca3255aeb1948812106c7cabafef314084f -- .gitignore "需求说明2.txt"; git status; git update-ref -d refs/stash; git show-ref | Select-String -Pattern "refs/stash"
+
+
+git ls-files | Select-String -Pattern "Qwen3-TTS-12Hz-1.7B-CustomVoice" -SimpleMatch; git rev-list --objects --all | Select-String -Pattern "safetensors" -SimpleMatch | Select-Object -First 20
+
+
+
+
+
+
+

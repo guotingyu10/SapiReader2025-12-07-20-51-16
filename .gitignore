@@ -3,6 +3,9 @@ bin/
 obj/
 publish/
 Qwen3-TTS-12Hz-1.7B-CustomVoice/
+
+# dotnet publish output (alternate)
+artifacts/
 # Visual Studio 缓存/选项
 .vs/
 *.suo
@@ -13,10 +16,7 @@ Qwen3-TTS-12Hz-1.7B-CustomVoice/
 # 用户特定文件
 *.rsuser
 *.suo
-*.user
-*.userosscache
-*.sln.docstates
-
+*.DotSettings.user
 # Build 结果
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -38,6 +38,7 @@ bld/
 *.snupkg
 **/packages/*
 
+**/packages/**/build/
 # 测试结果
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*
@@ -47,6 +48,9 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
+*.cache
+*.pidb
+*.svclog
 # 用户配置文件（根据项目需求，可能需要保留 config.json 模板）
 # config.json  # 如果需要保留配置模板，注释掉这行
 
@@ -54,6 +58,9 @@ artifacts/
 .idea/
 *.sln.iml
 
+
+# VS Code (keep tracked files if any are already committed)
+.vscode/
 # macOS
 .DS_Store
 
@@ -62,16 +69,25 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+$RECYCLE.BIN/
+*.lnk
 # 发布文件
 publish/
-*.exe
 *.dll
 *.pdb
 
+*.appxsym
+*.msix
+*.msixbundle
 # 日志文件
 *.log
 
+*.log.*
+sapi-reader.log*
 # 临时文件
 *.tmp
 *.temp
 *~
+*~
+*.bak
+*.swp
