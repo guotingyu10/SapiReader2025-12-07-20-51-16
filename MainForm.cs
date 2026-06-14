@@ -1904,6 +1904,20 @@ public partial class MainForm : Form
     private string RemoveLinesStartingWithDoubleSlash(string text)
     {
         if (string.IsNullOrEmpty(text)) return text;
+        int end = text.Length;
+        while (end > 0)
+        {
+            char c = text[end - 1];
+            if (c == '\r' || c == '\n') { end--; continue; }
+            break;
+        }
+        bool hasInnerNewline = false;
+        for (int k = 0; k < end; k++)
+        {
+            char c = text[k];
+            if (c == '\r' || c == '\n') { hasInnerNewline = true; break; }
+        }
+        if (!hasInnerNewline) return text;
         var sb = new StringBuilder(text.Length);
         int i = 0;
         bool atLineStart = true;
