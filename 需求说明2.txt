@@ -1,7 +1,7 @@
 dotnet run
 dotnet build -c Debug
 //dotnet run
-
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 
 为项目添加2种发音人
 用于朗读中英文混合内容;
