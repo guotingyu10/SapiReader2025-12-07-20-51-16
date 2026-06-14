@@ -1,10 +1,11 @@
 {
   "HotkeyIndex": "F1",
   "StopHotkeyIndex": "F3",
-  "AutoReadHotkeyIndex": "Ctrl+Alt+S",
+  "AutoReadHotkeyIndex": "Null",
   "ChineseVoiceName": "Microsoft Xiaoxiao",
   "EnglishVoiceName": "Microsoft Jenny",
-  "AutoSwitchVoice": true,
+  "Ignorelinesthatstartwith//":true,
+  "AutoSwitchVoice": false,
   "MixedChineseMinChars": 1,
   "MixedEnglishMinLetters": 1,
   "WarmUpVoices": true,

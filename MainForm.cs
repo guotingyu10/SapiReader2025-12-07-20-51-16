@@ -157,6 +157,7 @@ public partial class MainForm : Form
     private bool _onlyReadFirstLine = false;
     private bool _clearClipboard = true;
     private bool _removeSpaces = false;
+    private bool _ignoreLinesStartingWithDoubleSlash = false;
     private int _autoReadDelay = 1000;
     
     // 转义字符规则
@@ -673,6 +674,10 @@ public partial class MainForm : Form
                 int newlineIndex = rawText.IndexOfAny(new[] { '\r', '\n' });
                 if (newlineIndex >= 0) rawText = rawText.Substring(0, newlineIndex);
             }
+            if (_ignoreLinesStartingWithDoubleSlash)
+            {
+                rawText = RemoveLinesStartingWithDoubleSlash(rawText);
+            }
             if (_removeSpaces)
             {
                 rawText = rawText.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
@@ -1013,6 +1018,11 @@ public partial class MainForm : Form
             {
                 int newlineIndex = text.IndexOfAny(new[] { '\r', '\n' });
                 if (newlineIndex >= 0) text = text.Substring(0, newlineIndex);
+            }
+
+            if (_ignoreLinesStartingWithDoubleSlash)
+            {
+                text = RemoveLinesStartingWithDoubleSlash(text);
             }
 
             if (_removeSpaces)
@@ -1761,6 +1771,11 @@ public partial class MainForm : Form
                 if (newlineIndex >= 0) text = text.Substring(0, newlineIndex);
             }
 
+            if (_ignoreLinesStartingWithDoubleSlash)
+            {
+                text = RemoveLinesStartingWithDoubleSlash(text);
+            }
+
             if (_removeSpaces)
             {
                 text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
@@ -1883,6 +1898,59 @@ public partial class MainForm : Form
             }
         }
         catch { }
+    }
+
+    private string RemoveLinesStartingWithDoubleSlash(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        var sb = new StringBuilder(text.Length);
+        int i = 0;
+        bool atLineStart = true;
+        bool skipCurrentLine = false;
+        while (i < text.Length)
+        {
+            char c = text[i];
+            if (atLineStart)
+            {
+                if (c == ' ' || c == '\t')
+                {
+                    i++;
+                    continue;
+                }
+                if (c == '/' && i + 1 < text.Length && text[i + 1] == '/')
+                {
+                    skipCurrentLine = true;
+                }
+                atLineStart = false;
+            }
+            if (c == '\r' || c == '\n')
+            {
+                string nl;
+                if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+                {
+                    nl = "\r\n";
+                    i += 2;
+                }
+                else
+                {
+                    nl = c == '\r' ? "\r" : "\n";
+                    i++;
+                }
+                if (!skipCurrentLine)
+                {
+                    sb.Append(nl);
+                }
+                atLineStart = true;
+                skipCurrentLine = false;
+                continue;
+            }
+            if (!skipCurrentLine)
+            {
+                sb.Append(c);
+            }
+            i++;
+        }
+        return sb.ToString();
     }
 
     private string ApplyEscapeRules(string text)
@@ -2238,6 +2306,7 @@ public partial class MainForm : Form
         _onlyReadFirstLine = config.OnlyReadFirstLine;
         _clearClipboard = config.ClearClipboard;
         _removeSpaces = config.RemoveSpaces;
+        _ignoreLinesStartingWithDoubleSlash = config.IgnoreLinesThatStartWithDoubleSlash;
         _autoReadDelay = config.AutoReadDelay;
         
         if (config.RecordNumber > 0)
@@ -3855,6 +3924,8 @@ public class AppConfig
     public bool ClearClipboard { get; set; } = true;
     public int RecordNumber { get; set; } = 1000;
     public bool RemoveSpaces { get; set; } = false;
+    [JsonPropertyName("Ignorelinesthatstartwith//")]
+    public bool IgnoreLinesThatStartWithDoubleSlash { get; set; } = false;
     public int AutoReadDelay { get; set; } = 1000;
 }
 

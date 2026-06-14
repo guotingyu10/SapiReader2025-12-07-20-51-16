@@ -1,3 +1,8 @@
+dotnet run
+dotnet build -c Debug
+//dotnet run
+
+
 为项目添加2种发音人
 用于朗读中英文混合内容;
 出现汉字切换到中文发音人;
