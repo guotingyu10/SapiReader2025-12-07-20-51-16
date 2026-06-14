@@ -2,15 +2,6 @@ dotnet run
 dotnet build -c Debug
 //dotnet run
 
-A
-//B
-C
-//D
-//E
-F
-//G
-H
-
 dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 
 d:\a01\00123\2025sapi-reader\SapiReader\bin\Release\net8.0-windows\win-x64\publish\
