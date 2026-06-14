@@ -1,7 +1,21 @@
 dotnet run
 dotnet build -c Debug
 //dotnet run
+
+A
+//B
+C
+//D
+//E
+F
+//G
+H
+
 dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
+
+d:\a01\00123\2025sapi-reader\SapiReader\bin\Release\net8.0-windows\win-x64\publish\
+├── SapiReader.exe   ← 单文件可执行（自包含，含 .NET 运行时）
+└── config.json       ← 配置文件（与 exe 放在同一目录）
 
 为项目添加2种发音人
 用于朗读中英文混合内容;

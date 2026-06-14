@@ -1013,24 +1013,25 @@ public partial class MainForm : Form
                 return;
             }
             Log($"HandleHotkey selection length={text.Length} selection_ms={sw.ElapsedMilliseconds}");
-            
+
+            await TrySetClipboardTextWithRetryAsync(text, retries: 15, delayMs: 30);
+
+            string speakText = text;
             if (_onlyReadFirstLine)
             {
-                int newlineIndex = text.IndexOfAny(new[] { '\r', '\n' });
-                if (newlineIndex >= 0) text = text.Substring(0, newlineIndex);
+                int newlineIndex = speakText.IndexOfAny(new[] { '\r', '\n' });
+                if (newlineIndex >= 0) speakText = speakText.Substring(0, newlineIndex);
             }
 
             if (_ignoreLinesStartingWithDoubleSlash)
             {
-                text = RemoveLinesStartingWithDoubleSlash(text);
+                speakText = RemoveLinesStartingWithDoubleSlash(speakText);
             }
 
             if (_removeSpaces)
             {
-                text = text.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
+                speakText = speakText.Replace(" ", "").Replace("\t", "").Replace("\u3000", "");
             }
-
-            await TrySetClipboardTextWithRetryAsync(text, retries: 15, delayMs: 30);
 
             CancelCurrentOperation();
             var cts = new CancellationTokenSource();
@@ -1040,7 +1041,7 @@ public partial class MainForm : Form
             _statusLabel.Text = "正在处理文本...";
             _statusLabel.ForeColor = Color.Blue;
 
-            string processedText = await Task.Run(() => ApplyEscapeRules(text, token), token);
+            string processedText = await Task.Run(() => ApplyEscapeRules(speakText, token), token);
             if (token.IsCancellationRequested) return;
             Log($"HandleHotkey processed length={processedText.Length} process_ms={sw.ElapsedMilliseconds}");
 
